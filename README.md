@@ -27,6 +27,7 @@ It's a middleware service between your app and a provider.
 
 ### Project Structure
 
+```
 .
 ├── api/             # Transport: FastAPI routes, middleware, dependencies
 ├── services/        # Business Logic: Batcher, Queue management, Rate limiting
@@ -34,3 +35,4 @@ It's a middleware service between your app and a provider.
 ├── core/            # Cross-cutting: Config, Logging, Shared Models
 ├── main.py          # Entry point
 └── uv.lock          # Package management
+```
