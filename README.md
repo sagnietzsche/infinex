@@ -24,3 +24,13 @@ The gateway adds the features the naive setup lacks:
 6. **Streaming** — even with batching/caching, responses still stream token-by-token to clients (so they see incremental output, not a 5-second wait then a wall of text)
 
 It's a middleware service between your app and a provider.
+
+### Project Structure
+
+.
+├── api/             # Transport: FastAPI routes, middleware, dependencies
+├── services/        # Business Logic: Batcher, Queue management, Rate limiting
+├── infra/           # Infrastructure: Redis, OpenAI client, Database
+├── core/            # Cross-cutting: Config, Logging, Shared Models
+├── main.py          # Entry point
+└── uv.lock          # Package management
