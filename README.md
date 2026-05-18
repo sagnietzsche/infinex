@@ -25,6 +25,43 @@ The gateway adds the features the naive setup lacks:
 
 It's a middleware service between your app and a provider.
 
+### Feature 1: Batching
+
+The first gateway feature is implemented as an async microbatcher:
+
+- `POST /v1/chat/completions` accepts OpenAI-style chat completion requests.
+- Concurrent requests are queued together and flushed when either `BATCH_MAX_SIZE`
+  is reached or `BATCH_MAX_WAIT_MS` expires.
+- Each queued caller receives the response for its own request.
+- The current provider is a deterministic local echo provider, which keeps the
+  batching path testable before adding a real upstream LLM provider.
+
+Run the service:
+
+```bash
+uv run python main.py
+```
+
+Try a request:
+
+```bash
+curl -s http://127.0.0.1:8000/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"messages":[{"role":"user","content":"hello gateway"}]}'
+```
+
+Inspect batching counters:
+
+```bash
+curl -s http://127.0.0.1:8000/stats
+```
+
+Batching settings:
+
+```bash
+BATCH_MAX_SIZE=16 BATCH_MAX_WAIT_MS=50 uv run python main.py
+```
+
 ### Project Structure
 
 ```
