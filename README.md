@@ -25,6 +25,28 @@ The gateway adds the features the naive setup lacks:
 
 It's a middleware service between your app and a provider.
 
+### Kafka Queue
+
+The request handoff uses Kafka by default. HTTP handlers publish requests to
+`KAFKA_REQUEST_TOPIC` and wait on an in-process Future keyed by `request_id`.
+A worker consumes requests, executes the LLM call, publishes the result to
+`KAFKA_RESPONSE_TOPIC`, and the gateway response consumer resolves the waiting
+Future.
+
+Configuration:
+
+```
+REQUEST_QUEUE_BACKEND=kafka
+REQUEST_QUEUE_MAXSIZE=100
+KAFKA_BOOTSTRAP_SERVERS=localhost:9092
+KAFKA_REQUEST_TOPIC=llm-gateway.requests
+KAFKA_RESPONSE_TOPIC=llm-gateway.responses
+KAFKA_CONSUMER_GROUP=llm-gateway-workers
+GATEWAY_INSTANCE_ID=<optional stable instance id>
+```
+
+Use `REQUEST_QUEUE_BACKEND=memory` for local tests without Kafka.
+
 ### Project Structure
 
 ```
