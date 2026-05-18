@@ -1,26 +1,30 @@
-from typing import Any
+from fastapi import APIRouter, HTTPException
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
-
-from services.queue import QueueFullError, RequestQueueProtocol
-
-router = APIRouter()
+from core.models import ChatCompletionRequest, ChatCompletionResponse
+from services.batcher import AsyncRequestBatcher, BatcherStats
 
 
-def get_request_queue(request: Request) -> RequestQueueProtocol:
-    return request.app.state.request_queue
+def create_router(batcher: AsyncRequestBatcher) -> APIRouter:
+    router = APIRouter()
 
+    @router.get("/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
 
-@router.post("/v1/chat/completions")
-async def chat_completions(
-    payload: dict[str, Any], queue: RequestQueueProtocol = Depends(get_request_queue)
-) -> Any:
-    try:
-        item = await queue.enqueue(payload)
-    except QueueFullError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Request queue is full",
-        ) from exc
+    @router.get("/stats", response_model=BatcherStats)
+    async def stats() -> BatcherStats:
+        return batcher.stats()
 
-    return await item.future
+    @router.post("/v1/chat/completions", response_model=ChatCompletionResponse)
+    async def chat_completions(
+        request: ChatCompletionRequest,
+    ) -> ChatCompletionResponse:
+        if request.stream:
+            raise HTTPException(
+                status_code=400,
+                detail="Streaming responses are planned for feature 6.",
+            )
+
+        return await batcher.submit(request)
+
+    return router

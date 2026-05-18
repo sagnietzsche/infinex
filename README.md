@@ -25,27 +25,42 @@ The gateway adds the features the naive setup lacks:
 
 It's a middleware service between your app and a provider.
 
-### Kafka Queue
+### Feature 1: Batching
 
-The request handoff uses Kafka by default. HTTP handlers publish requests to
-`KAFKA_REQUEST_TOPIC` and wait on an in-process Future keyed by `request_id`.
-A worker consumes requests, executes the LLM call, publishes the result to
-`KAFKA_RESPONSE_TOPIC`, and the gateway response consumer resolves the waiting
-Future.
+The first gateway feature is implemented as an async microbatcher:
 
-Configuration:
+- `POST /v1/chat/completions` accepts OpenAI-style chat completion requests.
+- Concurrent requests are queued together and flushed when either `BATCH_MAX_SIZE`
+  is reached or `BATCH_MAX_WAIT_MS` expires.
+- Each queued caller receives the response for its own request.
+- The current provider is a deterministic local echo provider, which keeps the
+  batching path testable before adding a real upstream LLM provider.
 
-```
-REQUEST_QUEUE_BACKEND=kafka
-REQUEST_QUEUE_MAXSIZE=100
-KAFKA_BOOTSTRAP_SERVERS=localhost:9092
-KAFKA_REQUEST_TOPIC=llm-gateway.requests
-KAFKA_RESPONSE_TOPIC=llm-gateway.responses
-KAFKA_CONSUMER_GROUP=llm-gateway-workers
-GATEWAY_INSTANCE_ID=<optional stable instance id>
+Run the service:
+
+```bash
+uv run python main.py
 ```
 
-Use `REQUEST_QUEUE_BACKEND=memory` for local tests without Kafka.
+Try a request:
+
+```bash
+curl -s http://127.0.0.1:8000/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"messages":[{"role":"user","content":"hello gateway"}]}'
+```
+
+Inspect batching counters:
+
+```bash
+curl -s http://127.0.0.1:8000/stats
+```
+
+Batching settings:
+
+```bash
+BATCH_MAX_SIZE=16 BATCH_MAX_WAIT_MS=50 uv run python main.py
+```
 
 ### Project Structure
 
