@@ -1,75 +1,125 @@
 ## llm-gateway
 
-building an llm gateway
+A middleware service between your application and an LLM provider.
 
-When you have lots of clients sending requests to an LLM (like GPT-4), each request takes time. The LLM provider charges per request, and there are rate limits on how many you can send per minute. If you have an app with 100 users all chatting at once, you have 100 separate requests in flight, each one taking a few seconds.
+When you have many clients sending requests to an LLM, the naive one-request-per-connection setup has several problems:
 
-There are some problems with this naive setup:
-
-1. **Throughput is bad.** GPUs are optimized to process many requests at once (batching). When requests go one-by-one to the provider, you waste GPU efficiency. The provider may batch internally, but if you're hitting their API yourself, you're not getting that benefit at *your* layer.
-2. **No control plane.** Every client knows the provider's API key. There's no way to track who used how much, rate-limit specific users, or cache responses.
-3. **No observability.** You can't see what's happening across all your requests — error rates, latency distributions, etc.
-4. **Cold redundancy.** If the provider goes down, your app dies. There's no place to inject retries, failover, or circuit breakers.
+1. **Throughput is bad.** GPUs are optimized for batched inference. Sending requests one-by-one wastes GPU efficiency.
+2. **No control plane.** Every client holds the provider API key directly. There's no layer for per-user rate limiting, cost tracking, or access control.
+3. **No observability.** You can't see error rates, latency distributions, or aggregate usage across all requests.
+4. **No resilience.** If the provider goes down, your app dies. There's no place to inject retries, failover, or circuit breakers.
 5. **Identical requests get re-computed.** If 10 users ask the same question, the LLM processes it 10 times.
 
+The gateway addresses all of these at the middleware layer.
 
+---
 
-The gateway adds the features the naive setup lacks:
+### Features
 
-1. **Batching** — collect concurrent requests, send them as parallel/batched calls to the provider, distribute responses back
-2. **Caching** — if the same prompt has been asked recently, return the cached response without calling the provider
-3. **Rate limiting** — per-API-key limits to prevent abuse and stay within provider quotas
-4. **Auth** — API key validation
-5. **Observability** — log every request, expose metrics
-6. **Streaming** — even with batching/caching, responses still stream token-by-token to clients (so they see incremental output, not a 5-second wait then a wall of text)
+#### 1. Async Microbatcher
 
-It's a middleware service between your app and a provider.
+`POST /v1/chat/completions` (non-streaming) queues requests and flushes them as a parallel batch when either `BATCH_MAX_SIZE` is reached or `BATCH_MAX_WAIT_MS` expires. Each caller receives its own response.
 
-### Feature 1: Batching
+```bash
+# Non-streaming completion
+curl -s http://127.0.0.1:8000/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"messages":[{"role":"user","content":"hello gateway"}]}'
 
-The first gateway feature is implemented as an async microbatcher:
+# Inspect batching counters
+curl -s http://127.0.0.1:8000/stats
+```
 
-- `POST /v1/chat/completions` accepts OpenAI-style chat completion requests.
-- Concurrent requests are queued together and flushed when either `BATCH_MAX_SIZE`
-  is reached or `BATCH_MAX_WAIT_MS` expires.
-- Each queued caller receives the response for its own request.
-- The current provider is a deterministic local echo provider, which keeps the
-  batching path testable before adding a real upstream LLM provider.
+#### 2. Dynamic Streaming Batcher
 
-Run the service:
+`POST /v1/chat/completions` with `"stream": true` runs through `DynamicBatcher`, which collects concurrent requests into a batch, fires all provider calls in parallel, and fans tokens back to each caller over Server-Sent Events. Client sees incremental output; provider calls are still batched.
+
+```bash
+curl -s http://127.0.0.1:8000/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"messages":[{"role":"user","content":"stream this"}],"stream":true}'
+```
+
+#### 3. Request Queue
+
+`services/queue.py` provides a bounded queue with backpressure. Two backends:
+
+- **`InMemoryRequestQueue`** — `asyncio.Queue`-backed, raises `QueueFullError` when at capacity.
+- **`KafkaRequestQueue`** — publishes requests to a Kafka topic, resolves futures when a matching response arrives on the reply topic. Suitable for distributed, multi-gateway deployments.
+
+#### 4. Client Disconnect Detection
+
+During streaming, the response generator polls `request.is_disconnected()`. When the client drops, `item.cancelled` is set and the provider stream is closed immediately via `aclosing()`, so no tokens are wasted generating a response nobody will read.
+
+#### 5. Redis Response Cache
+
+`services/cache.py` caches completed responses in Redis, keyed by a SHA-256 hash of `(model, messages, temperature, max_tokens)`. Both the streaming and non-streaming paths check the cache before hitting the batcher. Cache hits replay stored chunks as SSE on the streaming path.
+
+```bash
+# Run with caching enabled (requires Redis at localhost:6379)
+uv run python main.py
+
+# Disable caching
+CACHE_ENABLED=false uv run python main.py
+```
+
+---
+
+### Running the service
 
 ```bash
 uv run python main.py
 ```
 
-Try a request:
+The service starts on `http://0.0.0.0:8000` with hot-reload enabled.
+
+**Endpoints:**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/health` | Liveness check |
+| `GET` | `/stats` | Batcher counters |
+| `POST` | `/v1/chat/completions` | Chat completion (streaming or non-streaming) |
+
+---
+
+### Configuration
+
+All settings are read from environment variables with the defaults shown below.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BATCH_MAX_SIZE` | `8` | Max requests per batch |
+| `BATCH_MAX_WAIT_MS` | `25` | Max time to wait before flushing a partial batch |
+| `PROVIDER_MODE` | `echo` | LLM backend (`echo` is a deterministic local stub) |
+| `REDIS_URL` | `redis://localhost:6379` | Redis connection URL for the response cache |
+| `CACHE_TTL_SECONDS` | `3600` | Cache entry lifetime in seconds |
+| `CACHE_ENABLED` | `true` | Set to `false` to bypass Redis entirely |
+
+Example with custom settings:
 
 ```bash
-curl -s http://127.0.0.1:8000/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{"messages":[{"role":"user","content":"hello gateway"}]}'
+BATCH_MAX_SIZE=16 BATCH_MAX_WAIT_MS=50 CACHE_TTL_SECONDS=300 uv run python main.py
 ```
 
-Inspect batching counters:
-
-```bash
-curl -s http://127.0.0.1:8000/stats
-```
-
-Batching settings:
-
-```bash
-BATCH_MAX_SIZE=16 BATCH_MAX_WAIT_MS=50 uv run python main.py
-```
+---
 
 ### Project Structure
 
 ```
 .
-├── api/             # Transport: FastAPI routes, middleware, dependencies
-├── services/        # Business Logic: Batcher, Queue management, Rate limiting
-├── infra/           # Infrastructure: Redis, OpenAI client, Database
-├── core/            # Cross-cutting: Config, Logging, Shared Models
-├── main.py          # Entry point
-└── uv.lock          # Package management
+├── api/
+│   └── routes.py        # FastAPI router: chat completions, health, stats
+├── core/
+│   ├── config.py        # Settings dataclass, env-var loading
+│   └── models.py        # Pydantic request/response models
+├── infra/
+│   └── providers.py     # LLMProvider / StreamingLLMProvider protocols + EchoProvider
+├── services/
+│   ├── batcher.py       # AsyncRequestBatcher (non-streaming) + DynamicBatcher (streaming)
+│   ├── cache.py         # ResponseCache backed by Redis
+│   └── queue.py         # InMemoryRequestQueue + KafkaRequestQueue
+├── tests/               # pytest test suite
+├── main.py              # App factory + entry point
+└── pyproject.toml
 ```
