@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import aclosing
 from dataclasses import dataclass, field
 
 from core.models import ChatCompletionRequest, ChatCompletionResponse
@@ -141,6 +142,7 @@ class DynamicBatcherStats:
 @dataclass
 class _StreamItem:
     request: ChatCompletionRequest
+    cancelled: bool = False
     response_channel: asyncio.Queue[str | BaseException | None] = field(
         default_factory=asyncio.Queue
     )
@@ -184,14 +186,12 @@ class DynamicBatcher:
             return
         self._task = asyncio.create_task(self._run(), name="dynamic-batcher")
 
-    async def submit(
-        self, request: ChatCompletionRequest
-    ) -> asyncio.Queue[str | BaseException | None]:
+    async def submit(self, request: ChatCompletionRequest) -> _StreamItem:
         if self._closed:
             raise RuntimeError("batcher is closed")
         item = _StreamItem(request=request)
         await self._input_queue.put(item)
-        return item.response_channel
+        return item
 
     async def close(self) -> None:
         self._closed = True
@@ -253,11 +253,16 @@ class DynamicBatcher:
 
     async def _stream_to_channel(self, item: _StreamItem) -> None:
         try:
-            async for token in self._provider.stream(item.request):
-                await item.response_channel.put(token)
+            # aclosing ensures aclose() is awaited when we exit early, so the
+            # underlying provider connection (e.g. httpx stream) is closed
+            # synchronously rather than waiting for GC.
+            async with aclosing(self._provider.stream(item.request)) as stream:
+                async for token in stream:
+                    if item.cancelled:
+                        return
+                    await item.response_channel.put(token)
         except Exception as exc:
-            # Route the exception to the caller via the response channel.
-            await item.response_channel.put(exc)
+            if not item.cancelled:
+                await item.response_channel.put(exc)
         finally:
-            # Always close the stream with the None sentinel.
             await item.response_channel.put(None)

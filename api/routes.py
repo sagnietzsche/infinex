@@ -1,10 +1,21 @@
-from fastapi import APIRouter, HTTPException
+from __future__ import annotations
+
+import asyncio
+import json
+from time import time
+from uuid import uuid4
+
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse
 
 from core.models import ChatCompletionRequest, ChatCompletionResponse
-from services.batcher import AsyncRequestBatcher, BatcherStats
+from services.batcher import AsyncRequestBatcher, BatcherStats, DynamicBatcher
 
 
-def create_router(batcher: AsyncRequestBatcher) -> APIRouter:
+def create_router(
+    batcher: AsyncRequestBatcher,
+    streaming_batcher: DynamicBatcher,
+) -> APIRouter:
     router = APIRouter()
 
     @router.get("/health")
@@ -15,16 +26,58 @@ def create_router(batcher: AsyncRequestBatcher) -> APIRouter:
     async def stats() -> BatcherStats:
         return batcher.stats()
 
-    @router.post("/v1/chat/completions", response_model=ChatCompletionResponse)
+    @router.post("/v1/chat/completions", response_model=None)
     async def chat_completions(
-        request: ChatCompletionRequest,
-    ) -> ChatCompletionResponse:
-        if request.stream:
-            raise HTTPException(
-                status_code=400,
-                detail="Streaming responses are planned for feature 6.",
-            )
+        body: ChatCompletionRequest,
+        request: Request,
+    ) -> StreamingResponse | ChatCompletionResponse:
+        if not body.stream:
+            return await batcher.submit(body)
 
-        return await batcher.submit(request)
+        item = await streaming_batcher.submit(body)
+        stream_id = f"chatcmpl-{uuid4().hex}"
+        created = int(time())
+
+        async def generate():
+            try:
+                while True:
+                    if await request.is_disconnected():
+                        item.cancelled = True
+                        return
+
+                    try:
+                        token = await asyncio.wait_for(
+                            item.response_channel.get(), timeout=0.05
+                        )
+                    except asyncio.TimeoutError:
+                        continue
+
+                    if token is None:
+                        break
+
+                    if isinstance(token, BaseException):
+                        raise token
+
+                    chunk = {
+                        "id": stream_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": body.model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": token},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n"
+
+                yield "data: [DONE]\n\n"
+            finally:
+                # Ensure cleanup even if the parent task is cancelled.
+                item.cancelled = True
+
+        return StreamingResponse(generate(), media_type="text/event-stream")
 
     return router

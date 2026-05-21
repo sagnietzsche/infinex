@@ -6,27 +6,36 @@ from fastapi import FastAPI
 
 from api.routes import create_router
 from core.config import Settings, load_settings
-from infra.providers import build_provider
-from services.batcher import AsyncRequestBatcher
+from infra.providers import build_provider, build_streaming_provider
+from services.batcher import AsyncRequestBatcher, DynamicBatcher
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or load_settings()
     provider = build_provider(settings)
+    streaming_provider = build_streaming_provider(settings)
     batcher = AsyncRequestBatcher(
         provider=provider,
+        max_batch_size=settings.batch_max_size,
+        max_wait_ms=settings.batch_max_wait_ms,
+    )
+    streaming_batcher = DynamicBatcher(
+        provider=streaming_provider,
         max_batch_size=settings.batch_max_size,
         max_wait_ms=settings.batch_max_wait_ms,
     )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        streaming_batcher.start()
         yield
         await batcher.close()
+        await streaming_batcher.close()
 
     app = FastAPI(title=settings.app_name, lifespan=lifespan)
     app.state.batcher = batcher
-    app.include_router(create_router(batcher))
+    app.state.streaming_batcher = streaming_batcher
+    app.include_router(create_router(batcher, streaming_batcher))
 
     return app
 
