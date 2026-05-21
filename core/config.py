@@ -8,6 +8,9 @@ class Settings:
     batch_max_size: int = 8
     batch_max_wait_ms: int = 25
     provider_mode: str = "echo"
+    redis_url: str = "redis://localhost:6379"
+    cache_ttl_seconds: int = 3600
+    cache_enabled: bool = True
 
 
 def _read_positive_int(name: str, default: int) -> int:
@@ -36,4 +39,9 @@ def load_settings() -> Settings:
             "BATCH_MAX_WAIT_MS", Settings.batch_max_wait_ms
         ),
         provider_mode=os.getenv("PROVIDER_MODE", Settings.provider_mode),
+        redis_url=os.getenv("REDIS_URL", Settings.redis_url),
+        cache_ttl_seconds=_read_positive_int(
+            "CACHE_TTL_SECONDS", Settings.cache_ttl_seconds
+        ),
+        cache_enabled=os.getenv("CACHE_ENABLED", "true").lower() != "false",
     )
