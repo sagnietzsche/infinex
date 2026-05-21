@@ -13,12 +13,12 @@ def _request(prompt: str) -> ChatCompletionRequest:
 async def _collect(channel: asyncio.Queue) -> list[str]:
     tokens: list[str] = []
     while True:
-        item = await channel.get()
-        if item is None:
+        value = await channel.get()
+        if value is None:
             break
-        if isinstance(item, BaseException):
-            raise item
-        tokens.append(item)
+        if isinstance(value, BaseException):
+            raise value
+        tokens.append(value)
     return tokens
 
 
@@ -31,11 +31,11 @@ class DynamicBatcherTests(unittest.IsolatedAsyncioTestCase):
         )
         batcher.start()
 
-        ch1 = await batcher.submit(_request("hello"))
-        ch2 = await batcher.submit(_request("world"))
+        item1 = await batcher.submit(_request("hello"))
+        item2 = await batcher.submit(_request("world"))
 
         tokens1, tokens2 = await asyncio.gather(
-            _collect(ch1), _collect(ch2)
+            _collect(item1.response_channel), _collect(item2.response_channel)
         )
 
         self.assertEqual(tokens1, ["Echo:", "hello"])
@@ -56,8 +56,8 @@ class DynamicBatcherTests(unittest.IsolatedAsyncioTestCase):
         )
         batcher.start()
 
-        channel = await batcher.submit(_request("solo"))
-        tokens = await _collect(channel)
+        item = await batcher.submit(_request("solo"))
+        tokens = await _collect(item.response_channel)
 
         self.assertEqual(tokens, ["Echo:", "solo"])
 
@@ -76,8 +76,8 @@ class DynamicBatcherTests(unittest.IsolatedAsyncioTestCase):
         )
         batcher.start()
 
-        channels = [await batcher.submit(_request(f"msg{i}")) for i in range(3)]
-        results = await asyncio.gather(*(_collect(ch) for ch in channels))
+        items = [await batcher.submit(_request(f"msg{i}")) for i in range(3)]
+        results = await asyncio.gather(*(_collect(it.response_channel) for it in items))
 
         for i, tokens in enumerate(results):
             self.assertIn(f"msg{i}", tokens)
@@ -98,13 +98,13 @@ class DynamicBatcherTests(unittest.IsolatedAsyncioTestCase):
         )
         batcher.start()
 
-        ch = await batcher.submit(_request("test"))
-        item = await ch.get()
-        self.assertIsInstance(item, RuntimeError)
-        sentinel = await ch.get()
+        stream_item = await batcher.submit(_request("test"))
+        first = await stream_item.response_channel.get()
+        self.assertIsInstance(first, RuntimeError)
+        sentinel = await stream_item.response_channel.get()
         self.assertIsNone(sentinel)
 
-        # Batcher loop is still alive for the next request
+        # batcher loop is still alive for the next request
         self.assertFalse(batcher._task.done())
 
         await batcher.close()
@@ -117,11 +117,11 @@ class DynamicBatcherTests(unittest.IsolatedAsyncioTestCase):
         )
         batcher.start()
 
-        ch1 = await batcher.submit(_request("first"))
-        tokens1 = await _collect(ch1)
+        item1 = await batcher.submit(_request("first"))
+        tokens1 = await _collect(item1.response_channel)
 
-        ch2 = await batcher.submit(_request("second"))
-        tokens2 = await _collect(ch2)
+        item2 = await batcher.submit(_request("second"))
+        tokens2 = await _collect(item2.response_channel)
 
         self.assertIn("first", tokens1)
         self.assertIn("second", tokens2)
