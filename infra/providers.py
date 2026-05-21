@@ -1,3 +1,4 @@
+from collections.abc import AsyncIterator
 from typing import Protocol
 
 from core.config import Settings
@@ -13,6 +14,11 @@ class LLMProvider(Protocol):
         self, request: ChatCompletionRequest
     ) -> ChatCompletionResponse:
         """Return a completion for one chat request."""
+
+
+class StreamingLLMProvider(Protocol):
+    def stream(self, request: ChatCompletionRequest) -> AsyncIterator[str]:
+        """Yield tokens one at a time for a chat request."""
 
 
 class EchoProvider:
@@ -36,8 +42,30 @@ class EchoProvider:
         )
 
 
+class EchoStreamingProvider:
+    async def stream(self, request: ChatCompletionRequest) -> AsyncIterator[str]:
+        last_user_message = next(
+            (
+                message.content
+                for message in reversed(request.messages)
+                if message.role == "user"
+            ),
+            "",
+        )
+        content = f"Echo: {last_user_message}" if last_user_message else "Echo:"
+        for token in content.split():
+            yield token
+
+
 def build_provider(settings: Settings) -> LLMProvider:
     if settings.provider_mode == "echo":
         return EchoProvider()
+
+    raise ValueError(f"Unsupported provider mode: {settings.provider_mode}")
+
+
+def build_streaming_provider(settings: Settings) -> StreamingLLMProvider:
+    if settings.provider_mode == "echo":
+        return EchoStreamingProvider()
 
     raise ValueError(f"Unsupported provider mode: {settings.provider_mode}")
