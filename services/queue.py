@@ -1,11 +1,17 @@
 import asyncio
 import json
+import logging
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+
+from services.observability import log_event, observe_latency, set_queue_depth
+
+
+logger = logging.getLogger(__name__)
 
 
 class QueueFullError(Exception):
@@ -17,6 +23,7 @@ class RequestItem:
     payload: dict[str, Any]
     future: asyncio.Future[Any]
     request_id: str
+    trace_id: str | None = None
 
 
 class RequestQueueProtocol(Protocol):
@@ -43,6 +50,8 @@ class InMemoryRequestQueue:
             raise ValueError("maxsize must be greater than 0")
 
         self._queue: asyncio.Queue[RequestItem] = asyncio.Queue(maxsize=maxsize)
+        self._metrics_queue_name = "memory_request_queue"
+        set_queue_depth(queue=self._metrics_queue_name, depth=0)
 
     @property
     def maxsize(self) -> int:
@@ -54,22 +63,51 @@ class InMemoryRequestQueue:
 
     async def enqueue(self, payload: dict[str, Any]) -> RequestItem:
         future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        trace_id = _trace_id_from_payload(payload)
         item = RequestItem(
             payload=payload,
             future=future,
             request_id=str(uuid.uuid4()),
+            trace_id=trace_id,
         )
 
         try:
             self._queue.put_nowait(item)
         except asyncio.QueueFull as exc:
             future.cancel()
+            log_event(
+                logger,
+                "queue.enqueue_rejected",
+                trace_id=trace_id,
+                request_id=item.request_id,
+                queue=self._metrics_queue_name,
+                queue_depth=self._queue.qsize(),
+            )
             raise QueueFullError("request queue is full") from exc
 
+        set_queue_depth(queue=self._metrics_queue_name, depth=self._queue.qsize())
+        log_event(
+            logger,
+            "queue.enqueue",
+            trace_id=trace_id,
+            request_id=item.request_id,
+            queue=self._metrics_queue_name,
+            queue_depth=self._queue.qsize(),
+        )
         return item
 
     async def get(self) -> RequestItem:
-        return await self._queue.get()
+        item = await self._queue.get()
+        set_queue_depth(queue=self._metrics_queue_name, depth=self._queue.qsize())
+        log_event(
+            logger,
+            "queue.dequeue",
+            trace_id=item.trace_id,
+            request_id=item.request_id,
+            queue=self._metrics_queue_name,
+            queue_depth=self._queue.qsize(),
+        )
+        return item
 
     def task_done(self) -> None:
         self._queue.task_done()
@@ -97,6 +135,8 @@ class KafkaRequestQueue:
         self._request_id_factory = request_id_factory or (lambda: str(uuid.uuid4()))
         self._producer: Any | None = None
         self._pending: dict[str, RequestItem] = {}
+        self._metrics_queue_name = "kafka_pending_requests"
+        set_queue_depth(queue=self._metrics_queue_name, depth=0)
 
     @property
     def maxsize(self) -> int:
@@ -117,6 +157,7 @@ class KafkaRequestQueue:
             if not item.future.done():
                 item.future.cancel()
         self._pending.clear()
+        set_queue_depth(queue=self._metrics_queue_name, depth=0)
 
         if self._producer is not None:
             await self._producer.stop()
@@ -127,12 +168,34 @@ class KafkaRequestQueue:
             raise RuntimeError("KafkaRequestQueue must be started before enqueue")
 
         if len(self._pending) >= self._maxsize:
+            log_event(
+                logger,
+                "queue.enqueue_rejected",
+                trace_id=_trace_id_from_payload(payload),
+                queue=self._metrics_queue_name,
+                queue_depth=len(self._pending),
+            )
             raise QueueFullError("request queue is full")
 
         request_id = self._request_id_factory()
         future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
-        item = RequestItem(payload=payload, future=future, request_id=request_id)
+        trace_id = _trace_id_from_payload(payload)
+        item = RequestItem(
+            payload=payload,
+            future=future,
+            request_id=request_id,
+            trace_id=trace_id,
+        )
         self._pending[request_id] = item
+        set_queue_depth(queue=self._metrics_queue_name, depth=len(self._pending))
+        log_event(
+            logger,
+            "queue.enqueue",
+            trace_id=trace_id,
+            request_id=request_id,
+            queue=self._metrics_queue_name,
+            queue_depth=len(self._pending),
+        )
 
         message = json.dumps(
             {
@@ -151,6 +214,7 @@ class KafkaRequestQueue:
             )
         except Exception:
             self._pending.pop(request_id, None)
+            set_queue_depth(queue=self._metrics_queue_name, depth=len(self._pending))
             future.cancel()
             raise
 
@@ -161,8 +225,17 @@ class KafkaRequestQueue:
         if item is None:
             return False
 
+        set_queue_depth(queue=self._metrics_queue_name, depth=len(self._pending))
         if not item.future.done():
             item.future.set_result(response)
+        log_event(
+            logger,
+            "queue.resolve",
+            trace_id=item.trace_id,
+            request_id=request_id,
+            queue=self._metrics_queue_name,
+            queue_depth=len(self._pending),
+        )
         return True
 
     def reject(self, request_id: str, exc: Exception) -> bool:
@@ -170,8 +243,18 @@ class KafkaRequestQueue:
         if item is None:
             return False
 
+        set_queue_depth(queue=self._metrics_queue_name, depth=len(self._pending))
         if not item.future.done():
             item.future.set_exception(exc)
+        log_event(
+            logger,
+            "queue.reject",
+            trace_id=item.trace_id,
+            request_id=request_id,
+            queue=self._metrics_queue_name,
+            queue_depth=len(self._pending),
+            error=repr(exc),
+        )
         return True
 
 
@@ -204,6 +287,7 @@ class InMemoryQueueConsumer:
     async def _run(self) -> None:
         while True:
             item = await self._queue.get()
+            started_at = asyncio.get_running_loop().time()
             try:
                 response = await execute_payload(self._executor, item.payload)
             except Exception as exc:
@@ -213,6 +297,10 @@ class InMemoryQueueConsumer:
                 if not item.future.done():
                     item.future.set_result(response)
             finally:
+                observe_latency(
+                    operation="queue_execute",
+                    seconds=asyncio.get_running_loop().time() - started_at,
+                )
                 self._queue.task_done()
 
 
@@ -286,7 +374,14 @@ class KafkaQueueConsumer:
                 request_id = envelope["request_id"]
                 gateway_id = envelope["gateway_id"]
                 payload = envelope["payload"]
-                response = await execute_payload(self._executor, payload)
+                started_at = asyncio.get_running_loop().time()
+                try:
+                    response = await execute_payload(self._executor, payload)
+                finally:
+                    observe_latency(
+                        operation="kafka_queue_execute",
+                        seconds=asyncio.get_running_loop().time() - started_at,
+                    )
             except Exception as exc:
                 if request_id is not None and gateway_id is not None:
                     await self._publish_response(
@@ -405,6 +500,11 @@ async def execute_payload(
         return await executor.execute(payload)
 
     return await executor(payload)
+
+
+def _trace_id_from_payload(payload: dict[str, Any]) -> str | None:
+    trace_id = payload.get("trace_id")
+    return trace_id if isinstance(trace_id, str) else None
 
 
 RequestQueue = InMemoryRequestQueue
