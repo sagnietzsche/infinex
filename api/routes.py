@@ -23,9 +23,34 @@ from services.observability import (
     record_request,
 )
 from services.queue import QueueFullError
+from services.retry import RetryExhaustedError, provider_status_code
 
 
 logger = logging.getLogger(__name__)
+_RETRY_ATTEMPTED_HEADER = "X-Retries-Attempted"
+_NO_STREAM_ITEM = object()
+
+
+def _raise_retry_exhausted(exc: RetryExhaustedError, *, trace_id: str) -> None:
+    headers = {
+        _RETRY_ATTEMPTED_HEADER: str(exc.retries_attempted),
+        "x-trace-id": trace_id,
+    }
+    original = exc.original
+
+    if isinstance(original, HTTPException):
+        merged_headers = {**(original.headers or {}), **headers}
+        raise HTTPException(
+            status_code=original.status_code,
+            detail=original.detail,
+            headers=merged_headers,
+        ) from exc
+
+    raise HTTPException(
+        status_code=provider_status_code(original) or 500,
+        detail=str(original),
+        headers=headers,
+    ) from exc
 
 
 def create_router(
@@ -109,6 +134,21 @@ def create_router(
                     status_code=503,
                     detail="Request queue is full",
                 ) from exc
+            except RetryExhaustedError as exc:
+                observe_latency(
+                    operation="http_chat_completion",
+                    seconds=perf_counter() - started_at,
+                )
+                log_event(
+                    logger,
+                    "request.failed",
+                    trace_id=trace_id,
+                    cache_hit=False,
+                    error=repr(exc.original),
+                    retries_attempted=exc.retries_attempted,
+                    stream=False,
+                )
+                _raise_retry_exhausted(exc, trace_id=trace_id)
             except Exception as exc:
                 observe_latency(
                     operation="http_chat_completion",
@@ -222,31 +262,88 @@ def create_router(
         stream_id = f"chatcmpl-{uuid4().hex}"
         created = int(time())
 
+        while True:
+            if await request.is_disconnected():
+                item.cancelled = True
+                observe_latency(
+                    operation="http_chat_completion_stream",
+                    seconds=perf_counter() - started_at,
+                )
+                log_event(
+                    logger,
+                    "request.disconnected",
+                    trace_id=trace_id,
+                    cache_hit=False,
+                    stream=True,
+                )
+                raise HTTPException(status_code=499, detail="Client disconnected")
+
+            try:
+                first_token = await asyncio.wait_for(
+                    item.response_channel.get(), timeout=0.05
+                )
+                break
+            except asyncio.TimeoutError:
+                continue
+
+        if isinstance(first_token, RetryExhaustedError):
+            observe_latency(
+                operation="http_chat_completion_stream",
+                seconds=perf_counter() - started_at,
+            )
+            log_event(
+                logger,
+                "request.failed",
+                trace_id=trace_id,
+                cache_hit=False,
+                error=repr(first_token.original),
+                retries_attempted=first_token.retries_attempted,
+                stream=True,
+            )
+            _raise_retry_exhausted(first_token, trace_id=trace_id)
+
+        if isinstance(first_token, BaseException):
+            observe_latency(
+                operation="http_chat_completion_stream",
+                seconds=perf_counter() - started_at,
+            )
+            log_event(
+                logger,
+                "request.failed",
+                trace_id=trace_id,
+                cache_hit=False,
+                error=repr(first_token),
+                stream=True,
+            )
+            raise first_token
+
         async def generate():
             collected: list[str] = []
+            token: str | BaseException | None | object = first_token
             try:
                 while True:
-                    if await request.is_disconnected():
-                        item.cancelled = True
-                        observe_latency(
-                            operation="http_chat_completion_stream",
-                            seconds=perf_counter() - started_at,
-                        )
-                        log_event(
-                            logger,
-                            "request.disconnected",
-                            trace_id=trace_id,
-                            cache_hit=False,
-                            stream=True,
-                        )
-                        return
+                    if token is _NO_STREAM_ITEM:
+                        if await request.is_disconnected():
+                            item.cancelled = True
+                            observe_latency(
+                                operation="http_chat_completion_stream",
+                                seconds=perf_counter() - started_at,
+                            )
+                            log_event(
+                                logger,
+                                "request.disconnected",
+                                trace_id=trace_id,
+                                cache_hit=False,
+                                stream=True,
+                            )
+                            return
 
-                    try:
-                        token = await asyncio.wait_for(
-                            item.response_channel.get(), timeout=0.05
-                        )
-                    except asyncio.TimeoutError:
-                        continue
+                        try:
+                            token = await asyncio.wait_for(
+                                item.response_channel.get(), timeout=0.05
+                            )
+                        except asyncio.TimeoutError:
+                            continue
 
                     if token is None:
                         break
@@ -266,6 +363,7 @@ def create_router(
                         )
                         raise token
 
+                    assert isinstance(token, str)
                     collected.append(token)
                     chunk = {
                         "id": stream_id,
@@ -281,6 +379,7 @@ def create_router(
                         ],
                     }
                     yield f"data: {json.dumps(chunk)}\n\n"
+                    token = _NO_STREAM_ITEM
 
                 if cache_key is not None and collected:
                     await cache.set(cache_key, collected)
