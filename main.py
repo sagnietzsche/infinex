@@ -11,9 +11,13 @@ from prometheus_client import make_asgi_app
 
 from api.routes import create_router
 from core.config import Settings, load_settings
-from infra.providers import build_provider, build_streaming_provider
+from infra.providers import (
+    build_provider_for_name,
+    build_streaming_provider_for_name,
+)
 from services.batcher import AsyncRequestBatcher, DynamicBatcher
 from services.cache import ResponseCache
+from services.provider_router import ProviderRoute, ProviderRouter
 from services.rate_limit import RedisTokenBucketRateLimiter
 from services.retry import RetryPolicy
 
@@ -29,18 +33,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         base_delay_ms=settings.retry_base_delay_ms,
         max_delay_ms=settings.retry_max_delay_ms,
     )
-    provider = retry_policy.wrap_provider(build_provider(settings))
-    streaming_provider = retry_policy.wrap_streaming_provider(
-        build_streaming_provider(settings)
+    provider_routes = []
+    for provider_name in settings.provider_fallback_chain:
+        provider_routes.append(
+            ProviderRoute(
+                name=provider_name,
+                provider=retry_policy.wrap_provider(
+                    build_provider_for_name(settings, provider_name)
+                ),
+                streaming_provider=retry_policy.wrap_streaming_provider(
+                    build_streaming_provider_for_name(settings, provider_name)
+                ),
+            )
+        )
+    provider_router = ProviderRouter(
+        routes=provider_routes,
+        model_mapping=settings.provider_model_mapping,
     )
     batcher = AsyncRequestBatcher(
-        provider=provider,
+        provider=provider_router,
         max_batch_size=settings.batch_max_size,
         max_wait_ms=settings.batch_max_wait_ms,
         max_queue_size=settings.batch_queue_max_size,
     )
     streaming_batcher = DynamicBatcher(
-        provider=streaming_provider,
+        provider=provider_router,
         max_batch_size=settings.batch_max_size,
         max_wait_ms=settings.batch_max_wait_ms,
         max_queue_size=settings.batch_queue_max_size,

@@ -75,3 +75,22 @@ def test_retry_settings_are_loaded_from_environment() -> None:
     assert settings.max_retries == 4
     assert settings.retry_base_delay_ms == 150
     assert settings.retry_max_delay_ms == 3000
+
+
+def test_provider_fallback_chain_selects_primary_and_loads_chain_keys() -> None:
+    with patch.dict(
+        "os.environ",
+        {
+            "PROVIDER_FALLBACK_CHAIN": "openai,anthropic",
+            "OPENAI_API_KEY": "openai-key",
+            "ANTHROPIC_API_KEY": "anthropic-key",
+        },
+        clear=True,
+    ):
+        settings = load_settings()
+
+    assert settings.provider == "openai"
+    assert settings.provider_mode == "openai"
+    assert settings.provider_fallback_chain == ("openai", "anthropic")
+    assert settings.openai_api_key == "openai-key"
+    assert settings.anthropic_api_key == "anthropic-key"

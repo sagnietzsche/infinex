@@ -133,6 +133,7 @@ All settings are read from environment variables with the defaults shown below.
 | `BATCH_QUEUE_MAX_SIZE` | `1024` | Max pending requests accepted before returning `503` |
 | `PROVIDER` | `echo` | LLM backend: `openai`, `anthropic`, `gemini`/`google`, `ollama`, or `echo` |
 | `PROVIDER_MODE` | `echo` | Backwards-compatible alias for `PROVIDER` |
+| `PROVIDER_FALLBACK_CHAIN` | empty | Ordered failover chain, e.g. `openai,anthropic`; first entry becomes the primary provider |
 | `OPENAI_API_KEY` | empty | Required when `PROVIDER=openai` |
 | `ANTHROPIC_API_KEY` | empty | Required when `PROVIDER=anthropic` |
 | `GOOGLE_API_KEY` / `GEMINI_API_KEY` | empty | Required when `PROVIDER=gemini` or `PROVIDER=google` |
@@ -157,6 +158,14 @@ Example with Anthropic:
 
 ```bash
 PROVIDER=anthropic ANTHROPIC_API_KEY=... uv run python main.py
+```
+
+Example with provider failover:
+
+```bash
+PROVIDER_FALLBACK_CHAIN=openai,anthropic \
+OPENAI_API_KEY=... ANTHROPIC_API_KEY=... \
+uv run python main.py
 ```
 
 ### Load testing

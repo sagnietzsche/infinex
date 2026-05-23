@@ -1,5 +1,11 @@
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 import os
+
+
+PROVIDER_MODEL_MAPPINGS: dict[str, str] = {
+    "openai/gpt-4o": "anthropic/claude-opus-4-5",
+}
 
 
 @dataclass(frozen=True)
@@ -10,6 +16,10 @@ class Settings:
     batch_queue_max_size: int = 1024
     provider: str = "echo"
     provider_mode: str | None = None
+    provider_fallback_chain: tuple[str, ...] = ()
+    provider_model_mapping: Mapping[str, str] = field(
+        default_factory=lambda: dict(PROVIDER_MODEL_MAPPINGS)
+    )
     openai_api_key: str | None = None
     anthropic_api_key: str | None = None
     google_api_key: str | None = None
@@ -26,8 +36,17 @@ class Settings:
 
     def __post_init__(self) -> None:
         provider = (self.provider_mode or self.provider).lower()
+        provider_fallback_chain = tuple(
+            item.lower() for item in self.provider_fallback_chain if item
+        )
+        if not provider_fallback_chain:
+            provider_fallback_chain = (provider,)
+        provider = provider_fallback_chain[0]
         object.__setattr__(self, "provider", provider)
         object.__setattr__(self, "provider_mode", provider)
+        object.__setattr__(
+            self, "provider_fallback_chain", provider_fallback_chain
+        )
 
 
 def _read_positive_int(
@@ -94,9 +113,17 @@ def _read_csv(name: str) -> tuple[str, ...]:
 
 
 def load_settings() -> Settings:
-    provider = os.getenv(
-        "PROVIDER", os.getenv("PROVIDER_MODE", Settings.provider)
-    ).lower()
+    provider_fallback_chain = tuple(
+        provider.lower() for provider in _read_csv("PROVIDER_FALLBACK_CHAIN")
+    )
+    provider = (
+        provider_fallback_chain[0]
+        if provider_fallback_chain
+        else os.getenv(
+            "PROVIDER", os.getenv("PROVIDER_MODE", Settings.provider)
+        ).lower()
+    )
+    configured_providers = set(provider_fallback_chain or (provider,))
 
     return Settings(
         app_name=os.getenv("APP_NAME", Settings.app_name),
@@ -114,13 +141,20 @@ def load_settings() -> Settings:
             "BATCH_QUEUE_MAX_SIZE", Settings.batch_queue_max_size
         ),
         provider=provider,
-        openai_api_key=os.getenv("OPENAI_API_KEY") if provider == "openai" else None,
+        provider_fallback_chain=provider_fallback_chain,
+        openai_api_key=(
+            os.getenv("OPENAI_API_KEY")
+            if "openai" in configured_providers
+            else None
+        ),
         anthropic_api_key=(
-            os.getenv("ANTHROPIC_API_KEY") if provider == "anthropic" else None
+            os.getenv("ANTHROPIC_API_KEY")
+            if "anthropic" in configured_providers
+            else None
         ),
         google_api_key=(
             os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-            if provider in {"gemini", "google"}
+            if configured_providers & {"gemini", "google"}
             else None
         ),
         ollama_base_url=os.getenv("OLLAMA_BASE_URL", Settings.ollama_base_url),
