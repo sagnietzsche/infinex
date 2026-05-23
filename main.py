@@ -17,6 +17,7 @@ from infra.providers import (
 )
 from services.batcher import AsyncRequestBatcher, DynamicBatcher
 from services.cache import ResponseCache
+from services.circuit_breaker import CircuitBreaker
 from services.provider_router import ProviderRoute, ProviderRouter
 from services.rate_limit import RedisTokenBucketRateLimiter
 from services.retry import RetryPolicy
@@ -46,9 +47,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 ),
             )
         )
+    circuit_breaker = CircuitBreaker(
+        redis_url=settings.redis_url,
+        providers=settings.provider_fallback_chain,
+        error_threshold=settings.cb_error_threshold,
+        window_seconds=settings.cb_window_seconds,
+        cooldown_seconds=settings.cb_cooldown_seconds,
+    )
     provider_router = ProviderRouter(
         routes=provider_routes,
         model_mapping=settings.provider_model_mapping,
+        circuit_breaker=circuit_breaker,
     )
     batcher = AsyncRequestBatcher(
         provider=provider_router,
@@ -90,12 +99,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await cache.close()
         if rate_limiter is not None:
             await rate_limiter.close()
+        await circuit_breaker.close()
 
     app = FastAPI(title=settings.app_name, lifespan=lifespan)
     app.state.batcher = batcher
     app.state.streaming_batcher = streaming_batcher
     app.state.cache = cache
     app.state.rate_limiter = rate_limiter
+    app.state.circuit_breaker = circuit_breaker
 
     @app.middleware("http")
     async def api_key_rate_limit_middleware(
@@ -129,7 +140,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return await call_next(request)
 
     app.mount("/metrics", make_asgi_app())
-    app.include_router(create_router(batcher, streaming_batcher, cache))
+    app.include_router(
+        create_router(batcher, streaming_batcher, cache, circuit_breaker)
+    )
 
     return app
 

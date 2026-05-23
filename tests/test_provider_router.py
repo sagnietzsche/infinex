@@ -14,6 +14,11 @@ from core.models import (
     ChatMessage,
     build_chat_completion_response,
 )
+from services.circuit_breaker import (
+    CircuitDecision,
+    CircuitSnapshot,
+    CircuitState,
+)
 from services.batcher import AsyncRequestBatcher, _StreamItem
 from services.provider_router import (
     AllProvidersFailedError,
@@ -68,6 +73,37 @@ class RecordingProvider:
             raise self.failures.pop(0)
         for token in self.stream_tokens:
             yield token
+
+
+class ProviderSelectiveCircuitBreaker:
+    def __init__(self, open_provider: str) -> None:
+        self.open_provider = open_provider
+        self.successes: list[str] = []
+        self.failures: list[str] = []
+
+    async def before_request(self, provider: str) -> CircuitDecision:
+        if provider == self.open_provider:
+            return CircuitDecision(allowed=False, state=CircuitState.OPEN)
+        return CircuitDecision(allowed=True, state=CircuitState.CLOSED)
+
+    async def record_success(self, provider: str) -> None:
+        self.successes.append(provider)
+
+    async def record_failure(self, provider: str) -> None:
+        self.failures.append(provider)
+
+
+class SnapshotCircuitBreaker:
+    async def snapshots(self) -> dict[str, CircuitSnapshot]:
+        return {
+            "openai": CircuitSnapshot(
+                provider="openai",
+                state=CircuitState.OPEN,
+                error_rate=0.75,
+                errors=3,
+                total=4,
+            )
+        }
 
 
 def _request(model: str = "gpt-4o") -> ChatCompletionRequest:
@@ -130,6 +166,27 @@ def test_router_skips_open_circuit_without_retrying() -> None:
 
     assert response.choices[0].message.content == "fallback"
     assert len(primary.requests) == 1
+
+
+def test_router_consults_circuit_breaker_before_dispatch() -> None:
+    primary = RecordingProvider(name="openai")
+    secondary = RecordingProvider(name="anthropic", content="fallback")
+    circuit_breaker = ProviderSelectiveCircuitBreaker(open_provider="openai")
+    router = ProviderRouter(
+        routes=[
+            ProviderRoute(name="openai", provider=primary),
+            ProviderRoute(name="anthropic", provider=secondary),
+        ],
+        model_mapping={"openai/gpt-4o": "anthropic/claude-opus-4-5"},
+        circuit_breaker=circuit_breaker,
+    )
+
+    response = asyncio.run(router.complete(_request()))
+
+    assert response.choices[0].message.content == "fallback"
+    assert primary.requests == []
+    assert secondary.requests[0].model == "claude-opus-4-5"
+    assert circuit_breaker.successes == ["anthropic"]
 
 
 def test_router_raises_structured_error_when_all_providers_fail() -> None:
@@ -229,6 +286,37 @@ def test_chat_completion_response_includes_provider_used_header() -> None:
     assert response.status_code == 200
     assert response.headers["x-provider-used"] == "anthropic"
     assert response.json()["choices"][0]["message"]["content"] == "fallback"
+
+
+def test_health_response_exposes_circuit_state() -> None:
+    app = FastAPI()
+    app.include_router(
+        create_router(
+            AsyncRequestBatcher(
+                provider=RecordingProvider(name="unused"),
+                max_batch_size=1,
+                max_wait_ms=1,
+            ),
+            UnusedStreamingBatcher(),
+            circuit_breaker=SnapshotCircuitBreaker(),
+        )
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ok",
+        "circuits": {
+            "openai": {
+                "state": "OPEN",
+                "error_rate": 0.75,
+                "errors": 3,
+                "total": 4,
+            }
+        },
+    }
 
 
 def test_streaming_response_includes_provider_used_header_and_served_model() -> None:

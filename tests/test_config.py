@@ -77,6 +77,23 @@ def test_retry_settings_are_loaded_from_environment() -> None:
     assert settings.retry_max_delay_ms == 3000
 
 
+def test_circuit_breaker_settings_are_loaded_from_environment() -> None:
+    with patch.dict(
+        "os.environ",
+        {
+            "CB_ERROR_THRESHOLD": "75",
+            "CB_WINDOW_SECONDS": "45",
+            "CB_COOLDOWN_SECONDS": "10",
+        },
+        clear=True,
+    ):
+        settings = load_settings()
+
+    assert settings.cb_error_threshold == 0.75
+    assert settings.cb_window_seconds == 45
+    assert settings.cb_cooldown_seconds == 10
+
+
 def test_provider_fallback_chain_selects_primary_and_loads_chain_keys() -> None:
     with patch.dict(
         "os.environ",

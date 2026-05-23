@@ -99,6 +99,14 @@ exponential backoff and are applied to streaming calls only until the first
 token is emitted. If retry attempts are exhausted, the provider error response
 includes `X-Retries-Attempted`.
 
+#### 9. Provider Failover + Circuit Breakers
+
+`PROVIDER_FALLBACK_CHAIN` configures ordered provider failover. Each provider
+also has an independent Redis-backed circuit breaker. The breaker tracks
+success/error events in a sliding window and opens when the provider error rate
+reaches `CB_ERROR_THRESHOLD`; open providers are skipped until
+`CB_COOLDOWN_SECONDS` elapses, then one half-open probe is allowed.
+
 ---
 
 ### Running the service
@@ -113,7 +121,7 @@ The service starts on `http://0.0.0.0:8000` with hot-reload enabled.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/health` | Liveness check |
+| `GET` | `/health` | Liveness check plus provider circuit states |
 | `GET` | `/metrics` | Prometheus metrics |
 | `GET` | `/stats` | Batcher counters |
 | `POST` | `/v1/chat/completions` | Chat completion (streaming or non-streaming) |
@@ -138,15 +146,18 @@ All settings are read from environment variables with the defaults shown below.
 | `ANTHROPIC_API_KEY` | empty | Required when `PROVIDER=anthropic` |
 | `GOOGLE_API_KEY` / `GEMINI_API_KEY` | empty | Required when `PROVIDER=gemini` or `PROVIDER=google` |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama base URL when `PROVIDER=ollama` |
-| `REDIS_URL` | `redis://localhost:6379` | Redis connection URL for the response cache |
+| `REDIS_URL` | `redis://localhost:6379` | Redis connection URL for cache, rate-limit, and circuit-breaker state |
 | `CACHE_TTL_SECONDS` | `3600` | Cache entry lifetime in seconds |
-| `CACHE_ENABLED` | `true` | Set to `false` to bypass Redis entirely |
+| `CACHE_ENABLED` | `true` | Set to `false` to disable response caching |
 | `API_KEYS` | empty | Comma-separated allowed API keys. Empty disables auth/rate-limit middleware |
 | `RATE_LIMIT_CAPACITY` | `60` | Max burst size per API key |
 | `RATE_LIMIT_REFILL_PER_SECOND` | `1.0` | Tokens restored per second per API key |
 | `MAX_RETRIES` | `3` | Provider retry attempts after the first failed call |
 | `RETRY_BASE_DELAY_MS` | `200` | Base delay for provider retry backoff |
 | `RETRY_MAX_DELAY_MS` | `5000` | Maximum delay cap for provider retry backoff |
+| `CB_ERROR_THRESHOLD` | `0.5` | Provider circuit opens at this error rate; values over `1` are treated as percentages |
+| `CB_WINDOW_SECONDS` | `60` | Sliding window used for provider error-rate counters |
+| `CB_COOLDOWN_SECONDS` | `30` | Time an open provider circuit stays blocked before one half-open probe |
 
 Example with custom settings:
 
@@ -198,6 +209,7 @@ batching sweep and `503` backpressure run.
 ├── services/
 │   ├── batcher.py       # AsyncRequestBatcher (non-streaming) + DynamicBatcher (streaming)
 │   ├── cache.py         # ResponseCache backed by Redis
+│   ├── circuit_breaker.py # Redis-backed provider circuit breaker
 │   ├── rate_limit.py    # Redis Lua token-bucket rate limiter
 │   └── queue.py         # InMemoryRequestQueue + KafkaRequestQueue
 ├── tests/               # pytest test suite

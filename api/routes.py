@@ -16,6 +16,7 @@ from core.models import (
 )
 from services.batcher import AsyncRequestBatcher, BatcherStats, DynamicBatcher
 from services.cache import ResponseCache, make_cache_key
+from services.circuit_breaker import CircuitBreaker
 from services.observability import (
     log_event,
     observe_latency,
@@ -64,12 +65,25 @@ def create_router(
     batcher: AsyncRequestBatcher,
     streaming_batcher: DynamicBatcher,
     cache: ResponseCache | None = None,
+    circuit_breaker: CircuitBreaker | None = None,
 ) -> APIRouter:
     router = APIRouter()
 
     @router.get("/health")
-    async def health() -> dict[str, str]:
-        return {"status": "ok"}
+    async def health() -> dict[str, object]:
+        body: dict[str, object] = {"status": "ok"}
+        if circuit_breaker is not None:
+            snapshots = await circuit_breaker.snapshots()
+            body["circuits"] = {
+                provider: {
+                    "state": snapshot.state.value,
+                    "error_rate": snapshot.error_rate,
+                    "errors": snapshot.errors,
+                    "total": snapshot.total,
+                }
+                for provider, snapshot in snapshots.items()
+            }
+        return body
 
     @router.get("/stats", response_model=BatcherStats)
     async def stats() -> BatcherStats:

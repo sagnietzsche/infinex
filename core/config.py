@@ -33,6 +33,9 @@ class Settings:
     max_retries: int = 3
     retry_base_delay_ms: int = 200
     retry_max_delay_ms: int = 5000
+    cb_error_threshold: float = 0.5
+    cb_window_seconds: int = 60
+    cb_cooldown_seconds: int = 30
 
     def __post_init__(self) -> None:
         provider = (self.provider_mode or self.provider).lower()
@@ -101,6 +104,25 @@ def _read_positive_float(name: str, default: float) -> float:
 
     if value <= 0:
         raise ValueError(f"{name} must be greater than zero")
+
+    return value
+
+
+def _read_threshold(name: str, default: float) -> float:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number") from exc
+
+    if value > 1:
+        value = value / 100
+
+    if value <= 0 or value > 1:
+        raise ValueError(f"{name} must be greater than zero and at most 100")
 
     return value
 
@@ -177,5 +199,14 @@ def load_settings() -> Settings:
         ),
         retry_max_delay_ms=_read_positive_int(
             "RETRY_MAX_DELAY_MS", Settings.retry_max_delay_ms
+        ),
+        cb_error_threshold=_read_threshold(
+            "CB_ERROR_THRESHOLD", Settings.cb_error_threshold
+        ),
+        cb_window_seconds=_read_positive_int(
+            "CB_WINDOW_SECONDS", Settings.cb_window_seconds
+        ),
+        cb_cooldown_seconds=_read_positive_int(
+            "CB_COOLDOWN_SECONDS", Settings.cb_cooldown_seconds
         ),
     )
