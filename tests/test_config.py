@@ -1,6 +1,6 @@
 from unittest.mock import patch
 
-from core.config import load_settings
+from core.config import Settings, load_settings
 
 
 def test_batch_tuning_aliases_are_supported() -> None:
@@ -18,3 +18,43 @@ def test_batch_tuning_aliases_are_supported() -> None:
     assert settings.batch_max_size == 24
     assert settings.batch_max_wait_ms == 15
     assert settings.batch_queue_max_size == 512
+
+
+def test_provider_env_selects_active_provider_and_key() -> None:
+    with patch.dict(
+        "os.environ",
+        {
+            "PROVIDER": "anthropic",
+            "OPENAI_API_KEY": "ignored-openai-key",
+            "ANTHROPIC_API_KEY": "anthropic-key",
+        },
+        clear=True,
+    ):
+        settings = load_settings()
+
+    assert settings.provider == "anthropic"
+    assert settings.provider_mode == "anthropic"
+    assert settings.anthropic_api_key == "anthropic-key"
+    assert settings.openai_api_key is None
+
+
+def test_provider_mode_alias_is_still_supported() -> None:
+    with patch.dict(
+        "os.environ",
+        {
+            "PROVIDER_MODE": "ollama",
+            "OLLAMA_BASE_URL": "http://localhost:11435",
+        },
+        clear=True,
+    ):
+        settings = load_settings()
+
+    assert settings.provider == "ollama"
+    assert settings.ollama_base_url == "http://localhost:11435"
+
+
+def test_settings_constructor_accepts_provider_mode_alias() -> None:
+    settings = Settings(provider_mode="anthropic")
+
+    assert settings.provider == "anthropic"
+    assert settings.provider_mode == "anthropic"
