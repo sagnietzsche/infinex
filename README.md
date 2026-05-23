@@ -63,6 +63,19 @@ uv run python main.py
 CACHE_ENABLED=false uv run python main.py
 ```
 
+#### 6. API Key Auth + Redis Rate Limiting
+
+When `API_KEYS` is configured, requests must include `X-API-Key` with one of the configured values. The same middleware applies a per-key Redis token bucket using a Lua script, so the read/update operation is atomic inside Redis. Limited requests return `429 Too Many Requests` with `Retry-After`.
+
+```bash
+API_KEYS=dev-key RATE_LIMIT_CAPACITY=60 RATE_LIMIT_REFILL_PER_SECOND=1 uv run python main.py
+
+curl -s http://127.0.0.1:8000/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -H 'x-api-key: dev-key' \
+  -d '{"messages":[{"role":"user","content":"hello gateway"}]}'
+```
+
 ---
 
 ### Running the service
@@ -95,6 +108,9 @@ All settings are read from environment variables with the defaults shown below.
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL for the response cache |
 | `CACHE_TTL_SECONDS` | `3600` | Cache entry lifetime in seconds |
 | `CACHE_ENABLED` | `true` | Set to `false` to bypass Redis entirely |
+| `API_KEYS` | empty | Comma-separated allowed API keys. Empty disables auth/rate-limit middleware |
+| `RATE_LIMIT_CAPACITY` | `60` | Max burst size per API key |
+| `RATE_LIMIT_REFILL_PER_SECOND` | `1.0` | Tokens restored per second per API key |
 
 Example with custom settings:
 
@@ -118,6 +134,7 @@ BATCH_MAX_SIZE=16 BATCH_MAX_WAIT_MS=50 CACHE_TTL_SECONDS=300 uv run python main.
 ├── services/
 │   ├── batcher.py       # AsyncRequestBatcher (non-streaming) + DynamicBatcher (streaming)
 │   ├── cache.py         # ResponseCache backed by Redis
+│   ├── rate_limit.py    # Redis Lua token-bucket rate limiter
 │   └── queue.py         # InMemoryRequestQueue + KafkaRequestQueue
 ├── tests/               # pytest test suite
 ├── main.py              # App factory + entry point
