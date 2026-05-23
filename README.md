@@ -76,6 +76,19 @@ curl -s http://127.0.0.1:8000/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"hello gateway"}]}'
 ```
 
+#### 7. Prometheus Metrics + Trace Logs
+
+Prometheus metrics are exposed at `/metrics`. The gateway tracks request volume,
+latency histograms, cache hit rate, current queue depth, and batch fill metrics.
+
+```bash
+curl -s http://127.0.0.1:8000/metrics
+```
+
+Structured JSON logs include `trace_id`, and batcher events include both
+`trace_id` and `batcher_id`. Clients can pass `X-Trace-Id`; otherwise the
+gateway generates one and returns it in the `X-Trace-Id` response header.
+
 ---
 
 ### Running the service
@@ -91,6 +104,7 @@ The service starts on `http://0.0.0.0:8000` with hot-reload enabled.
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Liveness check |
+| `GET` | `/metrics` | Prometheus metrics |
 | `GET` | `/stats` | Batcher counters |
 | `POST` | `/v1/chat/completions` | Chat completion (streaming or non-streaming) |
 

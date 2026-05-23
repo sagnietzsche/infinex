@@ -1,10 +1,13 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 import hmac
+import logging
+import os
 
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from prometheus_client import make_asgi_app
 
 from api.routes import create_router
 from core.config import Settings, load_settings
@@ -15,6 +18,10 @@ from services.rate_limit import RedisTokenBucketRateLimiter
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO"),
+        format="%(message)s",
+    )
     settings = settings or load_settings()
     provider = build_provider(settings)
     streaming_provider = build_streaming_provider(settings)
@@ -67,7 +74,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def api_key_rate_limit_middleware(
         request: Request, call_next
     ):
-        if request.url.path == "/health" or rate_limiter is None:
+        if (
+            request.url.path == "/health"
+            or request.url.path.startswith("/metrics")
+            or rate_limiter is None
+        ):
             return await call_next(request)
 
         api_key = request.headers.get("x-api-key")
@@ -90,6 +101,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         return await call_next(request)
 
+    app.mount("/metrics", make_asgi_app())
     app.include_router(create_router(batcher, streaming_batcher, cache))
 
     return app

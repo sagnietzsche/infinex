@@ -3,9 +3,20 @@ from __future__ import annotations
 import asyncio
 from contextlib import aclosing
 from dataclasses import dataclass, field
+import logging
+from uuid import uuid4
 
 from core.models import ChatCompletionRequest, ChatCompletionResponse
 from infra.providers import LLMProvider, StreamingLLMProvider
+from services.observability import (
+    log_event,
+    observe_batch,
+    observe_latency,
+    set_queue_depth,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -22,6 +33,8 @@ class BatcherStats:
 class _QueuedRequest:
     request: ChatCompletionRequest
     future: asyncio.Future[ChatCompletionResponse]
+    trace_id: str
+    enqueued_at: float
 
 
 class AsyncRequestBatcher:
@@ -48,19 +61,40 @@ class AsyncRequestBatcher:
         self._processed_requests = 0
         self._processed_batches = 0
         self._largest_batch_size = 0
+        self._batcher_id = f"async-{uuid4().hex[:8]}"
+        self._metrics_queue_name = "async_batcher"
+        set_queue_depth(queue=self._metrics_queue_name, depth=0)
 
     async def submit(
-        self, request: ChatCompletionRequest
+        self, request: ChatCompletionRequest, trace_id: str | None = None
     ) -> ChatCompletionResponse:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[ChatCompletionResponse] = loop.create_future()
+        trace_id = trace_id or uuid4().hex
         should_flush = False
 
         async with self._lock:
             if self._closed:
                 raise RuntimeError("batcher is closed")
 
-            self._queue.append(_QueuedRequest(request=request, future=future))
+            self._queue.append(
+                _QueuedRequest(
+                    request=request,
+                    future=future,
+                    trace_id=trace_id,
+                    enqueued_at=loop.time(),
+                )
+            )
+            queue_depth = len(self._queue)
+            set_queue_depth(queue=self._metrics_queue_name, depth=queue_depth)
+            log_event(
+                logger,
+                "batcher.enqueue",
+                trace_id=trace_id,
+                batcher_id=self._batcher_id,
+                queue_depth=queue_depth,
+                stream=False,
+            )
 
             if len(self._queue) == 1:
                 self._flush_handle = loop.call_later(
@@ -79,6 +113,7 @@ class AsyncRequestBatcher:
         async with self._lock:
             batch = self._queue
             self._queue = []
+            set_queue_depth(queue=self._metrics_queue_name, depth=0)
 
             if self._flush_handle is not None:
                 self._flush_handle.cancel()
@@ -87,23 +122,70 @@ class AsyncRequestBatcher:
         if not batch:
             return
 
+        loop = asyncio.get_running_loop()
+        batch_id = f"batch-{uuid4().hex[:8]}"
         self._processed_batches += 1
         self._processed_requests += len(batch)
         self._largest_batch_size = max(self._largest_batch_size, len(batch))
+        observe_batch(
+            batcher=self._batcher_id,
+            size=len(batch),
+            max_size=self._max_batch_size,
+        )
+        for item in batch:
+            observe_latency(
+                operation="batcher_queue_wait",
+                seconds=loop.time() - item.enqueued_at,
+            )
+        log_event(
+            logger,
+            "batcher.flush",
+            batcher_id=self._batcher_id,
+            batch_id=batch_id,
+            batch_size=len(batch),
+            trace_ids=[item.trace_id for item in batch],
+            stream=False,
+        )
 
+        provider_started_at = loop.time()
         results = await asyncio.gather(
             *(self._provider.complete(item.request) for item in batch),
             return_exceptions=True,
+        )
+        observe_latency(
+            operation="batcher_provider_batch",
+            seconds=loop.time() - provider_started_at,
         )
 
         for item, result in zip(batch, results, strict=True):
             if item.future.done():
                 continue
 
+            observe_latency(
+                operation="batcher_request_total",
+                seconds=loop.time() - item.enqueued_at,
+            )
             if isinstance(result, Exception):
                 item.future.set_exception(result)
+                log_event(
+                    logger,
+                    "batcher.request_failed",
+                    trace_id=item.trace_id,
+                    batcher_id=self._batcher_id,
+                    batch_id=batch_id,
+                    error=repr(result),
+                    stream=False,
+                )
             else:
                 item.future.set_result(result)
+                log_event(
+                    logger,
+                    "batcher.request_completed",
+                    trace_id=item.trace_id,
+                    batcher_id=self._batcher_id,
+                    batch_id=batch_id,
+                    stream=False,
+                )
 
     async def close(self) -> None:
         async with self._lock:
@@ -142,6 +224,8 @@ class DynamicBatcherStats:
 @dataclass
 class _StreamItem:
     request: ChatCompletionRequest
+    trace_id: str
+    enqueued_at: float
     cancelled: bool = False
     response_channel: asyncio.Queue[str | BaseException | None] = field(
         default_factory=asyncio.Queue
@@ -180,17 +264,38 @@ class DynamicBatcher:
         self._processed_requests = 0
         self._processed_batches = 0
         self._largest_batch_size = 0
+        self._batcher_id = f"dynamic-{uuid4().hex[:8]}"
+        self._metrics_queue_name = "dynamic_batcher"
+        set_queue_depth(queue=self._metrics_queue_name, depth=0)
 
     def start(self) -> None:
         if self._task is not None and not self._task.done():
             return
         self._task = asyncio.create_task(self._run(), name="dynamic-batcher")
 
-    async def submit(self, request: ChatCompletionRequest) -> _StreamItem:
+    async def submit(
+        self, request: ChatCompletionRequest, trace_id: str | None = None
+    ) -> _StreamItem:
         if self._closed:
             raise RuntimeError("batcher is closed")
-        item = _StreamItem(request=request)
+        loop = asyncio.get_running_loop()
+        trace_id = trace_id or uuid4().hex
+        item = _StreamItem(
+            request=request,
+            trace_id=trace_id,
+            enqueued_at=loop.time(),
+        )
         await self._input_queue.put(item)
+        queue_depth = self._input_queue.qsize()
+        set_queue_depth(queue=self._metrics_queue_name, depth=queue_depth)
+        log_event(
+            logger,
+            "batcher.enqueue",
+            trace_id=trace_id,
+            batcher_id=self._batcher_id,
+            queue_depth=queue_depth,
+            stream=True,
+        )
         return item
 
     async def close(self) -> None:
@@ -207,6 +312,10 @@ class DynamicBatcher:
                 item = self._input_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+            set_queue_depth(
+                queue=self._metrics_queue_name,
+                depth=self._input_queue.qsize(),
+            )
             await item.response_channel.put(RuntimeError("batcher is closed"))
             await item.response_channel.put(None)
 
@@ -224,6 +333,10 @@ class DynamicBatcher:
         while True:
             # Block until the first request of the next batch arrives.
             first = await self._input_queue.get()
+            set_queue_depth(
+                queue=self._metrics_queue_name,
+                depth=self._input_queue.qsize(),
+            )
             batch: list[_StreamItem] = [first]
 
             # Open a MAX_WAIT_MS window to accumulate additional requests.
@@ -237,21 +350,47 @@ class DynamicBatcher:
                         self._input_queue.get(), timeout=remaining
                     )
                     batch.append(item)
+                    set_queue_depth(
+                        queue=self._metrics_queue_name,
+                        depth=self._input_queue.qsize(),
+                    )
                 except asyncio.TimeoutError:
                     break
 
+            loop = asyncio.get_running_loop()
+            batch_id = f"batch-{uuid4().hex[:8]}"
             self._processed_batches += 1
             self._processed_requests += len(batch)
             self._largest_batch_size = max(self._largest_batch_size, len(batch))
+            observe_batch(
+                batcher=self._batcher_id,
+                size=len(batch),
+                max_size=self._max_batch_size,
+            )
+            for item in batch:
+                observe_latency(
+                    operation="dynamic_batcher_queue_wait",
+                    seconds=loop.time() - item.enqueued_at,
+                )
+            log_event(
+                logger,
+                "batcher.flush",
+                batcher_id=self._batcher_id,
+                batch_id=batch_id,
+                batch_size=len(batch),
+                trace_ids=[item.trace_id for item in batch],
+                stream=True,
+            )
 
             # Fire all provider calls in parallel; a failure in one must not
             # propagate and crash the loop — return_exceptions=True ensures this.
             await asyncio.gather(
-                *(self._stream_to_channel(item) for item in batch),
+                *(self._stream_to_channel(item, batch_id=batch_id) for item in batch),
                 return_exceptions=True,
             )
 
-    async def _stream_to_channel(self, item: _StreamItem) -> None:
+    async def _stream_to_channel(self, item: _StreamItem, *, batch_id: str) -> None:
+        loop = asyncio.get_running_loop()
         try:
             # aclosing ensures aclose() is awaited when we exit early, so the
             # underlying provider connection (e.g. httpx stream) is closed
@@ -259,10 +398,40 @@ class DynamicBatcher:
             async with aclosing(self._provider.stream(item.request)) as stream:
                 async for token in stream:
                     if item.cancelled:
+                        log_event(
+                            logger,
+                            "batcher.stream_cancelled",
+                            trace_id=item.trace_id,
+                            batcher_id=self._batcher_id,
+                            batch_id=batch_id,
+                            stream=True,
+                        )
                         return
                     await item.response_channel.put(token)
         except Exception as exc:
             if not item.cancelled:
                 await item.response_channel.put(exc)
+                log_event(
+                    logger,
+                    "batcher.request_failed",
+                    trace_id=item.trace_id,
+                    batcher_id=self._batcher_id,
+                    batch_id=batch_id,
+                    error=repr(exc),
+                    stream=True,
+                )
         finally:
+            observe_latency(
+                operation="dynamic_batcher_request_total",
+                seconds=loop.time() - item.enqueued_at,
+            )
+            if not item.cancelled:
+                log_event(
+                    logger,
+                    "batcher.request_completed",
+                    trace_id=item.trace_id,
+                    batcher_id=self._batcher_id,
+                    batch_id=batch_id,
+                    stream=True,
+                )
             await item.response_channel.put(None)
