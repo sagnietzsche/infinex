@@ -8,6 +8,7 @@ from typing import Any
 
 from core.models import ChatCompletionRequest, ChatCompletionResponse
 from infra.providers import LLMProvider, StreamingLLMProvider
+from services.circuit_breaker import CircuitBreaker, CircuitOpenError
 from services.observability import log_event, record_provider_failover
 from services.retry import (
     RetryExhaustedError,
@@ -53,12 +54,14 @@ class ProviderRouter:
         *,
         routes: list[ProviderRoute],
         model_mapping: Mapping[str, str],
+        circuit_breaker: CircuitBreaker | None = None,
     ) -> None:
         if not routes:
             raise ValueError("at least one provider route is required")
         self._routes = routes
         self._model_mapping = model_mapping
         self._primary_provider = routes[0].name
+        self._circuit_breaker = circuit_breaker
 
     async def complete(
         self, request: ChatCompletionRequest
@@ -66,10 +69,16 @@ class ProviderRouter:
         failures: list[ProviderFailure] = []
 
         for index, route in enumerate(self._routes):
+            if not await self._route_allowed(
+                route=route, index=index, failures=failures
+            ):
+                continue
+
             routed_request = self._request_for_route(request, route.name)
             try:
                 response = await route.provider.complete(routed_request)
             except Exception as exc:
+                await self._record_provider_failure(route.name)
                 if not _should_failover(exc):
                     raise
                 failures.append(_failure_for(route.name, exc))
@@ -80,6 +89,7 @@ class ProviderRouter:
                 )
                 continue
 
+            await self._record_provider_success(route.name)
             _set_provider_used(response, route.name)
             return response
 
@@ -91,6 +101,11 @@ class ProviderRouter:
         failures: list[ProviderFailure] = []
 
         for index, route in enumerate(self._routes):
+            if not await self._route_allowed(
+                route=route, index=index, failures=failures
+            ):
+                continue
+
             provider = route.streaming_provider or route.provider
             routed_request = self._request_for_route(request, route.name)
             yielded = False
@@ -111,8 +126,10 @@ class ProviderRouter:
                         provider=route.name,
                         model=routed_request.model,
                     )
+                await self._record_provider_success(route.name)
                 return
             except Exception as exc:
+                await self._record_provider_failure(route.name)
                 if yielded or not _should_failover(exc):
                     raise
                 failures.append(_failure_for(route.name, exc))
@@ -151,6 +168,37 @@ class ProviderRouter:
         if next_index >= len(self._routes):
             return None
         return self._routes[next_index]
+
+    async def _route_allowed(
+        self,
+        *,
+        route: ProviderRoute,
+        index: int,
+        failures: list[ProviderFailure],
+    ) -> bool:
+        if self._circuit_breaker is None:
+            return True
+
+        decision = await self._circuit_breaker.before_request(route.name)
+        if decision.allowed:
+            return True
+
+        exc = CircuitOpenError(route.name, decision.state)
+        failures.append(_failure_for(route.name, exc))
+        self._record_failover(
+            route=route,
+            exc=exc,
+            next_route=self._next_route(index),
+        )
+        return False
+
+    async def _record_provider_success(self, provider_name: str) -> None:
+        if self._circuit_breaker is not None:
+            await self._circuit_breaker.record_success(provider_name)
+
+    async def _record_provider_failure(self, provider_name: str) -> None:
+        if self._circuit_breaker is not None:
+            await self._circuit_breaker.record_failure(provider_name)
 
     def _record_failover(
         self,
