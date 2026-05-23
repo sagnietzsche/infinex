@@ -14,6 +14,7 @@ from services.observability import (
     observe_latency,
     set_queue_depth,
 )
+from services.queue import QueueFullError
 
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,7 @@ class BatcherStats:
     largest_batch_size: int
     max_batch_size: int
     max_wait_ms: int
+    max_queue_size: int
 
 
 @dataclass
@@ -44,15 +46,19 @@ class AsyncRequestBatcher:
         provider: LLMProvider,
         max_batch_size: int,
         max_wait_ms: int,
+        max_queue_size: int = 1024,
     ) -> None:
         if max_batch_size <= 0:
             raise ValueError("max_batch_size must be greater than zero")
         if max_wait_ms <= 0:
             raise ValueError("max_wait_ms must be greater than zero")
+        if max_queue_size <= 0:
+            raise ValueError("max_queue_size must be greater than zero")
 
         self._provider = provider
         self._max_batch_size = max_batch_size
         self._max_wait_ms = max_wait_ms
+        self._max_queue_size = max_queue_size
         self._max_wait_seconds = max_wait_ms / 1000
         self._queue: list[_QueuedRequest] = []
         self._lock = asyncio.Lock()
@@ -76,6 +82,23 @@ class AsyncRequestBatcher:
         async with self._lock:
             if self._closed:
                 raise RuntimeError("batcher is closed")
+
+            if len(self._queue) >= self._max_queue_size:
+                future.cancel()
+                set_queue_depth(
+                    queue=self._metrics_queue_name,
+                    depth=len(self._queue),
+                )
+                log_event(
+                    logger,
+                    "batcher.enqueue_rejected",
+                    trace_id=trace_id,
+                    batcher_id=self._batcher_id,
+                    queue_depth=len(self._queue),
+                    max_queue_size=self._max_queue_size,
+                    stream=False,
+                )
+                raise QueueFullError("request queue is full")
 
             self._queue.append(
                 _QueuedRequest(
@@ -201,6 +224,7 @@ class AsyncRequestBatcher:
             largest_batch_size=self._largest_batch_size,
             max_batch_size=self._max_batch_size,
             max_wait_ms=self._max_wait_ms,
+            max_queue_size=self._max_queue_size,
         )
 
     def _schedule_flush(self) -> None:
@@ -219,6 +243,7 @@ class DynamicBatcherStats:
     largest_batch_size: int
     max_batch_size: int
     max_wait_ms: int
+    max_queue_size: int
 
 
 @dataclass
@@ -248,17 +273,23 @@ class DynamicBatcher:
         provider: StreamingLLMProvider,
         max_batch_size: int,
         max_wait_ms: int,
+        max_queue_size: int = 1024,
     ) -> None:
         if max_batch_size <= 0:
             raise ValueError("max_batch_size must be greater than zero")
         if max_wait_ms <= 0:
             raise ValueError("max_wait_ms must be greater than zero")
+        if max_queue_size <= 0:
+            raise ValueError("max_queue_size must be greater than zero")
 
         self._provider = provider
         self._max_batch_size = max_batch_size
         self._max_wait_ms = max_wait_ms
+        self._max_queue_size = max_queue_size
         self._max_wait_seconds = max_wait_ms / 1000
-        self._input_queue: asyncio.Queue[_StreamItem] = asyncio.Queue()
+        self._input_queue: asyncio.Queue[_StreamItem] = asyncio.Queue(
+            maxsize=max_queue_size
+        )
         self._task: asyncio.Task[None] | None = None
         self._closed = False
         self._processed_requests = 0
@@ -285,7 +316,23 @@ class DynamicBatcher:
             trace_id=trace_id,
             enqueued_at=loop.time(),
         )
-        await self._input_queue.put(item)
+        try:
+            self._input_queue.put_nowait(item)
+        except asyncio.QueueFull as exc:
+            set_queue_depth(
+                queue=self._metrics_queue_name,
+                depth=self._input_queue.qsize(),
+            )
+            log_event(
+                logger,
+                "batcher.enqueue_rejected",
+                trace_id=trace_id,
+                batcher_id=self._batcher_id,
+                queue_depth=self._input_queue.qsize(),
+                max_queue_size=self._max_queue_size,
+                stream=True,
+            )
+            raise QueueFullError("request queue is full") from exc
         queue_depth = self._input_queue.qsize()
         set_queue_depth(queue=self._metrics_queue_name, depth=queue_depth)
         log_event(
@@ -327,6 +374,7 @@ class DynamicBatcher:
             largest_batch_size=self._largest_batch_size,
             max_batch_size=self._max_batch_size,
             max_wait_ms=self._max_wait_ms,
+            max_queue_size=self._max_queue_size,
         )
 
     async def _run(self) -> None:

@@ -6,7 +6,7 @@ import logging
 from time import perf_counter, time
 from uuid import uuid4
 
-from fastapi import APIRouter, Request, Response
+from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 
 from core.models import (
@@ -22,6 +22,7 @@ from services.observability import (
     record_cache_lookup,
     record_request,
 )
+from services.queue import QueueFullError
 
 
 logger = logging.getLogger(__name__)
@@ -90,6 +91,24 @@ def create_router(
 
             try:
                 result = await batcher.submit(body, trace_id=trace_id)
+            except QueueFullError as exc:
+                observe_latency(
+                    operation="http_chat_completion",
+                    seconds=perf_counter() - started_at,
+                )
+                log_event(
+                    logger,
+                    "request.rejected",
+                    trace_id=trace_id,
+                    cache_hit=False,
+                    error=repr(exc),
+                    stream=False,
+                    status_code=503,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="Request queue is full",
+                ) from exc
             except Exception as exc:
                 observe_latency(
                     operation="http_chat_completion",
@@ -168,6 +187,24 @@ def create_router(
 
         try:
             item = await streaming_batcher.submit(body, trace_id=trace_id)
+        except QueueFullError as exc:
+            observe_latency(
+                operation="http_chat_completion_stream",
+                seconds=perf_counter() - started_at,
+            )
+            log_event(
+                logger,
+                "request.rejected",
+                trace_id=trace_id,
+                cache_hit=False,
+                error=repr(exc),
+                stream=True,
+                status_code=503,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Request queue is full",
+            ) from exc
         except Exception as exc:
             observe_latency(
                 operation="http_chat_completion_stream",

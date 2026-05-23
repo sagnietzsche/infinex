@@ -29,11 +29,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         provider=provider,
         max_batch_size=settings.batch_max_size,
         max_wait_ms=settings.batch_max_wait_ms,
+        max_queue_size=settings.batch_queue_max_size,
     )
     streaming_batcher = DynamicBatcher(
         provider=streaming_provider,
         max_batch_size=settings.batch_max_size,
         max_wait_ms=settings.batch_max_wait_ms,
+        max_queue_size=settings.batch_queue_max_size,
     )
     cache = (
         ResponseCache(

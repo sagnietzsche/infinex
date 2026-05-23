@@ -1,11 +1,14 @@
 import asyncio
 import json
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from time import sleep
 from typing import Any
 
 from fastapi.testclient import TestClient
 
+from core.config import Settings
 from main import create_app
 from services.queue import (
     InMemoryQueueConsumer,
@@ -227,27 +230,52 @@ class KafkaRequestQueueTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RouteTests(unittest.TestCase):
-    def test_chat_completions_waits_for_consumer_result(self) -> None:
+    def test_chat_completions_returns_batcher_result(self) -> None:
         app = create_app(
-            queue_maxsize=1,
-            executor=StaticExecutor(),
-            queue_backend="memory",
+            Settings(
+                cache_enabled=False,
+                batch_max_wait_ms=5,
+            )
         )
 
         with TestClient(app) as client:
-            response = client.post("/v1/chat/completions", json={"model": "test"})
+            response = client.post(
+                "/v1/chat/completions",
+                json={"messages": [{"role": "user", "content": "test"}]},
+            )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"received": {"model": "test"}})
+        self.assertEqual(
+            response.json()["choices"][0]["message"]["content"],
+            "Echo: test",
+        )
 
     def test_chat_completions_returns_503_when_queue_is_full(self) -> None:
-        app = create_app(queue_maxsize=1, start_consumer=False, queue_backend="memory")
+        app = create_app(
+            Settings(
+                cache_enabled=False,
+                batch_max_size=10,
+                batch_max_wait_ms=500,
+                batch_queue_max_size=1,
+            )
+        )
+        payload = {"messages": [{"role": "user", "content": "test"}]}
 
         with TestClient(app) as client:
-            client.portal.call(
-                client.app.state.request_queue.enqueue, {"already": "queued"}
-            )
-            response = client.post("/v1/chat/completions", json={"model": "test"})
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                first = executor.submit(
+                    lambda: client.post("/v1/chat/completions", json=payload)
+                )
+
+                for _ in range(20):
+                    stats = client.get("/stats").json()
+                    if stats["queued_requests"] == 1:
+                        break
+                    sleep(0.01)
+
+                response = client.post("/v1/chat/completions", json=payload)
+                first_response = first.result(timeout=2)
 
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json(), {"detail": "Request queue is full"})
+        self.assertEqual(first_response.status_code, 200)
