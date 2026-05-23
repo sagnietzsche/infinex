@@ -15,6 +15,7 @@ from infra.providers import build_provider, build_streaming_provider
 from services.batcher import AsyncRequestBatcher, DynamicBatcher
 from services.cache import ResponseCache
 from services.rate_limit import RedisTokenBucketRateLimiter
+from services.retry import RetryPolicy
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -23,8 +24,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         format="%(message)s",
     )
     settings = settings or load_settings()
-    provider = build_provider(settings)
-    streaming_provider = build_streaming_provider(settings)
+    retry_policy = RetryPolicy(
+        max_retries=settings.max_retries,
+        base_delay_ms=settings.retry_base_delay_ms,
+        max_delay_ms=settings.retry_max_delay_ms,
+    )
+    provider = retry_policy.wrap_provider(build_provider(settings))
+    streaming_provider = retry_policy.wrap_streaming_provider(
+        build_streaming_provider(settings)
+    )
     batcher = AsyncRequestBatcher(
         provider=provider,
         max_batch_size=settings.batch_max_size,

@@ -91,6 +91,14 @@ Structured JSON logs include `trace_id`, and batcher events include both
 `trace_id` and `batcher_id`. Clients can pass `X-Trace-Id`; otherwise the
 gateway generates one and returns it in the `X-Trace-Id` response header.
 
+#### 8. Provider Retries
+
+Provider responses with `429`, `500`, `502`, `503`, or `504` are retried
+automatically before the gateway returns a failure. Retries use full-jitter
+exponential backoff and are applied to streaming calls only until the first
+token is emitted. If retry attempts are exhausted, the provider error response
+includes `X-Retries-Attempted`.
+
 ---
 
 ### Running the service
@@ -135,6 +143,9 @@ All settings are read from environment variables with the defaults shown below.
 | `API_KEYS` | empty | Comma-separated allowed API keys. Empty disables auth/rate-limit middleware |
 | `RATE_LIMIT_CAPACITY` | `60` | Max burst size per API key |
 | `RATE_LIMIT_REFILL_PER_SECOND` | `1.0` | Tokens restored per second per API key |
+| `MAX_RETRIES` | `3` | Provider retry attempts after the first failed call |
+| `RETRY_BASE_DELAY_MS` | `200` | Base delay for provider retry backoff |
+| `RETRY_MAX_DELAY_MS` | `5000` | Maximum delay cap for provider retry backoff |
 
 Example with custom settings:
 

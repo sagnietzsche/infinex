@@ -20,6 +20,9 @@ class Settings:
     allowed_api_keys: tuple[str, ...] = ()
     rate_limit_capacity: int = 60
     rate_limit_refill_per_second: float = 1.0
+    max_retries: int = 3
+    retry_base_delay_ms: int = 200
+    retry_max_delay_ms: int = 5000
 
     def __post_init__(self) -> None:
         provider = (self.provider_mode or self.provider).lower()
@@ -47,6 +50,22 @@ def _read_positive_int(
 
     if value <= 0:
         raise ValueError(f"{name} must be greater than zero")
+
+    return value
+
+
+def _read_non_negative_int(name: str, default: int) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+
+    if value < 0:
+        raise ValueError(f"{name} must be greater than or equal to zero")
 
     return value
 
@@ -117,5 +136,12 @@ def load_settings() -> Settings:
         rate_limit_refill_per_second=_read_positive_float(
             "RATE_LIMIT_REFILL_PER_SECOND",
             Settings.rate_limit_refill_per_second,
+        ),
+        max_retries=_read_non_negative_int("MAX_RETRIES", Settings.max_retries),
+        retry_base_delay_ms=_read_positive_int(
+            "RETRY_BASE_DELAY_MS", Settings.retry_base_delay_ms
+        ),
+        retry_max_delay_ms=_read_positive_int(
+            "RETRY_MAX_DELAY_MS", Settings.retry_max_delay_ms
         ),
     )

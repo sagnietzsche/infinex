@@ -58,3 +58,20 @@ def test_settings_constructor_accepts_provider_mode_alias() -> None:
 
     assert settings.provider == "anthropic"
     assert settings.provider_mode == "anthropic"
+
+
+def test_retry_settings_are_loaded_from_environment() -> None:
+    with patch.dict(
+        "os.environ",
+        {
+            "MAX_RETRIES": "4",
+            "RETRY_BASE_DELAY_MS": "150",
+            "RETRY_MAX_DELAY_MS": "3000",
+        },
+        clear=True,
+    ):
+        settings = load_settings()
+
+    assert settings.max_retries == 4
+    assert settings.retry_base_delay_ms == 150
+    assert settings.retry_max_delay_ms == 3000
