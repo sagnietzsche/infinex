@@ -7,6 +7,7 @@ from core.models import (
     build_chat_completion_response,
 )
 from services.batcher import AsyncRequestBatcher
+from services.queue import QueueFullError
 
 
 class RecordingProvider:
@@ -76,3 +77,24 @@ class AsyncRequestBatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stats.processed_batches, 1)
         self.assertEqual(stats.processed_requests, 1)
         self.assertEqual(stats.largest_batch_size, 1)
+
+    async def test_rejects_when_queue_is_full(self) -> None:
+        provider = RecordingProvider()
+        batcher = AsyncRequestBatcher(
+            provider=provider,
+            max_batch_size=10,
+            max_wait_ms=1000,
+            max_queue_size=1,
+        )
+
+        first = asyncio.create_task(batcher.submit(request_with_prompt("one")))
+        await asyncio.sleep(0)
+
+        with self.assertRaises(QueueFullError):
+            await batcher.submit(request_with_prompt("two"))
+
+        await batcher.close()
+        self.assertEqual(
+            (await first).choices[0].message.content,
+            "done: one",
+        )

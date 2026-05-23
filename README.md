@@ -19,6 +19,8 @@ The gateway addresses all of these at the middleware layer.
 #### 1. Async Microbatcher
 
 `POST /v1/chat/completions` (non-streaming) queues requests and flushes them as a parallel batch when either `BATCH_MAX_SIZE` is reached or `BATCH_MAX_WAIT_MS` expires. Each caller receives its own response.
+The pending batch queue is bounded by `BATCH_QUEUE_MAX_SIZE`; when that queue is
+full the gateway returns `503` with `{"detail":"Request queue is full"}`.
 
 ```bash
 # Non-streaming completion
@@ -116,8 +118,11 @@ All settings are read from environment variables with the defaults shown below.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BATCH_MAX_SIZE` | `8` | Max requests per batch |
-| `BATCH_MAX_WAIT_MS` | `25` | Max time to wait before flushing a partial batch |
+| `BATCH_MAX_SIZE` | `16` | Max requests per batch |
+| `BATCH_SIZE` | `16` | Alias for `BATCH_MAX_SIZE`; recommended tuning knob |
+| `BATCH_MAX_WAIT_MS` | `20` | Max time to wait before flushing a partial batch |
+| `MAX_WAIT_MS` | `20` | Alias for `BATCH_MAX_WAIT_MS`; recommended tuning knob |
+| `BATCH_QUEUE_MAX_SIZE` | `1024` | Max pending requests accepted before returning `503` |
 | `PROVIDER_MODE` | `echo` | LLM backend (`echo` is a deterministic local stub) |
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL for the response cache |
 | `CACHE_TTL_SECONDS` | `3600` | Cache entry lifetime in seconds |
@@ -129,8 +134,22 @@ All settings are read from environment variables with the defaults shown below.
 Example with custom settings:
 
 ```bash
-BATCH_MAX_SIZE=16 BATCH_MAX_WAIT_MS=50 CACHE_TTL_SECONDS=300 uv run python main.py
+BATCH_SIZE=16 MAX_WAIT_MS=20 CACHE_TTL_SECONDS=300 uv run python main.py
 ```
+
+### Load testing
+
+Use `scripts/load/batching_sweet_spot.js` to validate 50+ concurrent users,
+generate p95/p99 reports, and force the queue-full backpressure path:
+
+```bash
+CACHE_ENABLED=false BATCH_SIZE=16 MAX_WAIT_MS=20 uv run python main.py
+k6 run -e VUS=60 -e DURATION=2m scripts/load/batching_sweet_spot.js
+```
+
+Reports are written to `reports/k6-batching-summary.json` and
+`reports/k6-batching-summary.md`. See `docs/load-testing.md` for the full
+batching sweep and `503` backpressure run.
 
 ---
 
