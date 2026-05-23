@@ -74,10 +74,28 @@ def observe_batch(*, batcher: str, size: int, max_size: int) -> None:
     BATCH_FILL_RATIO.labels(batcher=batcher).set(size / max_size)
 
 
+PROVIDER_FAILOVER_COUNT = Counter(
+    "provider_failover_count",
+    "Number of provider failover events.",
+    ["from_provider", "to_provider", "reason"],
+)
+
+
+def record_provider_failover(
+    *, from_provider: str, to_provider: str, reason: str
+) -> None:
+    PROVIDER_FAILOVER_COUNT.labels(
+        from_provider=from_provider,
+        to_provider=to_provider,
+        reason=reason,
+    ).inc()
+
+
 def log_event(
     logger: logging.Logger,
     event: str,
+    level: int = logging.INFO,
     **fields: Any,
 ) -> None:
     payload = {"event": event, **fields}
-    logger.info(json.dumps(payload, sort_keys=True, default=str))
+    logger.log(level, json.dumps(payload, sort_keys=True, default=str))

@@ -252,7 +252,7 @@ class _StreamItem:
     trace_id: str
     enqueued_at: float
     cancelled: bool = False
-    response_channel: asyncio.Queue[str | BaseException | None] = field(
+    response_channel: asyncio.Queue[object] = field(
         default_factory=asyncio.Queue
     )
 

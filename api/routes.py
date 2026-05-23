@@ -7,7 +7,7 @@ from time import perf_counter, time
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from core.models import (
     ChatCompletionRequest,
@@ -22,12 +22,19 @@ from services.observability import (
     record_cache_lookup,
     record_request,
 )
+from services.provider_router import (
+    AllProvidersFailedError,
+    ProviderStreamMetadata,
+    all_providers_error_body,
+    provider_used,
+)
 from services.queue import QueueFullError
 from services.retry import RetryExhaustedError, provider_status_code
 
 
 logger = logging.getLogger(__name__)
 _RETRY_ATTEMPTED_HEADER = "X-Retries-Attempted"
+_PROVIDER_USED_HEADER = "X-Provider-Used"
 _NO_STREAM_ITEM = object()
 
 
@@ -149,6 +156,25 @@ def create_router(
                     stream=False,
                 )
                 _raise_retry_exhausted(exc, trace_id=trace_id)
+            except AllProvidersFailedError as exc:
+                observe_latency(
+                    operation="http_chat_completion",
+                    seconds=perf_counter() - started_at,
+                )
+                log_event(
+                    logger,
+                    "request.failed",
+                    trace_id=trace_id,
+                    cache_hit=False,
+                    error=repr(exc),
+                    stream=False,
+                    status_code=503,
+                )
+                return JSONResponse(
+                    all_providers_error_body(exc),
+                    status_code=503,
+                    headers={"x-trace-id": trace_id},
+                )
             except Exception as exc:
                 observe_latency(
                     operation="http_chat_completion",
@@ -166,6 +192,10 @@ def create_router(
 
             if cache_key is not None:
                 await cache.set(cache_key, [result.choices[0].message.content])
+
+            provider_name = provider_used(result)
+            if provider_name is not None:
+                response.headers[_PROVIDER_USED_HEADER] = provider_name
 
             observe_latency(
                 operation="http_chat_completion",
@@ -286,6 +316,56 @@ def create_router(
             except asyncio.TimeoutError:
                 continue
 
+        provider_name: str | None = None
+        stream_model = body.model
+
+        while isinstance(first_token, ProviderStreamMetadata):
+            provider_name = first_token.provider
+            stream_model = first_token.model
+            while True:
+                if await request.is_disconnected():
+                    item.cancelled = True
+                    observe_latency(
+                        operation="http_chat_completion_stream",
+                        seconds=perf_counter() - started_at,
+                    )
+                    log_event(
+                        logger,
+                        "request.disconnected",
+                        trace_id=trace_id,
+                        cache_hit=False,
+                        stream=True,
+                    )
+                    raise HTTPException(status_code=499, detail="Client disconnected")
+
+                try:
+                    first_token = await asyncio.wait_for(
+                        item.response_channel.get(), timeout=0.05
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    continue
+
+        if isinstance(first_token, AllProvidersFailedError):
+            observe_latency(
+                operation="http_chat_completion_stream",
+                seconds=perf_counter() - started_at,
+            )
+            log_event(
+                logger,
+                "request.failed",
+                trace_id=trace_id,
+                cache_hit=False,
+                error=repr(first_token),
+                stream=True,
+                status_code=503,
+            )
+            return JSONResponse(
+                all_providers_error_body(first_token),
+                status_code=503,
+                headers={"x-trace-id": trace_id},
+            )
+
         if isinstance(first_token, RetryExhaustedError):
             observe_latency(
                 operation="http_chat_completion_stream",
@@ -319,7 +399,7 @@ def create_router(
 
         async def generate():
             collected: list[str] = []
-            token: str | BaseException | None | object = first_token
+            token: object = first_token
             try:
                 while True:
                     if token is _NO_STREAM_ITEM:
@@ -348,6 +428,10 @@ def create_router(
                     if token is None:
                         break
 
+                    if isinstance(token, ProviderStreamMetadata):
+                        token = _NO_STREAM_ITEM
+                        continue
+
                     if isinstance(token, BaseException):
                         observe_latency(
                             operation="http_chat_completion_stream",
@@ -369,7 +453,7 @@ def create_router(
                         "id": stream_id,
                         "object": "chat.completion.chunk",
                         "created": created,
-                        "model": body.model,
+                        "model": stream_model,
                         "choices": [
                             {
                                 "index": 0,
@@ -403,7 +487,14 @@ def create_router(
         return StreamingResponse(
             generate(),
             media_type="text/event-stream",
-            headers={"x-trace-id": trace_id},
+            headers={
+                **({"x-trace-id": trace_id}),
+                **(
+                    {_PROVIDER_USED_HEADER: provider_name}
+                    if provider_name is not None
+                    else {}
+                ),
+            },
         )
 
     return router
