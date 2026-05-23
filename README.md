@@ -123,7 +123,12 @@ All settings are read from environment variables with the defaults shown below.
 | `BATCH_MAX_WAIT_MS` | `20` | Max time to wait before flushing a partial batch |
 | `MAX_WAIT_MS` | `20` | Alias for `BATCH_MAX_WAIT_MS`; recommended tuning knob |
 | `BATCH_QUEUE_MAX_SIZE` | `1024` | Max pending requests accepted before returning `503` |
-| `PROVIDER_MODE` | `echo` | LLM backend (`echo` is a deterministic local stub) |
+| `PROVIDER` | `echo` | LLM backend: `openai`, `anthropic`, `gemini`/`google`, `ollama`, or `echo` |
+| `PROVIDER_MODE` | `echo` | Backwards-compatible alias for `PROVIDER` |
+| `OPENAI_API_KEY` | empty | Required when `PROVIDER=openai` |
+| `ANTHROPIC_API_KEY` | empty | Required when `PROVIDER=anthropic` |
+| `GOOGLE_API_KEY` / `GEMINI_API_KEY` | empty | Required when `PROVIDER=gemini` or `PROVIDER=google` |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama base URL when `PROVIDER=ollama` |
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL for the response cache |
 | `CACHE_TTL_SECONDS` | `3600` | Cache entry lifetime in seconds |
 | `CACHE_ENABLED` | `true` | Set to `false` to bypass Redis entirely |
@@ -135,6 +140,12 @@ Example with custom settings:
 
 ```bash
 BATCH_SIZE=16 MAX_WAIT_MS=20 CACHE_TTL_SECONDS=300 uv run python main.py
+```
+
+Example with Anthropic:
+
+```bash
+PROVIDER=anthropic ANTHROPIC_API_KEY=... uv run python main.py
 ```
 
 ### Load testing
@@ -163,7 +174,7 @@ batching sweep and `503` backpressure run.
 │   ├── config.py        # Settings dataclass, env-var loading
 │   └── models.py        # Pydantic request/response models
 ├── infra/
-│   └── providers.py     # LLMProvider / StreamingLLMProvider protocols + EchoProvider
+│   └── providers/       # BaseProvider + LiteLLM-backed OpenAI/Anthropic/Gemini/Ollama providers
 ├── services/
 │   ├── batcher.py       # AsyncRequestBatcher (non-streaming) + DynamicBatcher (streaming)
 │   ├── cache.py         # ResponseCache backed by Redis
