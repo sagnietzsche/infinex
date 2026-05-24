@@ -56,6 +56,7 @@ class Settings:
     cb_error_threshold: float = 0.5
     cb_window_seconds: int = 60
     cb_cooldown_seconds: int = 30
+    shutdown_drain_timeout_seconds: float = 30.0
 
     def __post_init__(self) -> None:
         provider = (self.provider_mode or self.provider).lower()
@@ -129,6 +130,22 @@ def _read_positive_float(name: str, default: float) -> float:
 
     if value <= 0:
         raise ValueError(f"{name} must be greater than zero")
+
+    return value
+
+
+def _read_non_negative_float(name: str, default: float) -> float:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number") from exc
+
+    if value < 0:
+        raise ValueError(f"{name} must be greater than or equal to zero")
 
     return value
 
@@ -294,5 +311,9 @@ def load_settings() -> Settings:
         ),
         cb_cooldown_seconds=_read_positive_int(
             "CB_COOLDOWN_SECONDS", Settings.cb_cooldown_seconds
+        ),
+        shutdown_drain_timeout_seconds=_read_non_negative_float(
+            "SHUTDOWN_DRAIN_TIMEOUT_SECONDS",
+            Settings.shutdown_drain_timeout_seconds,
         ),
     )

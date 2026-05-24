@@ -95,6 +95,17 @@ def test_circuit_breaker_settings_are_loaded_from_environment() -> None:
     assert settings.cb_cooldown_seconds == 10
 
 
+def test_shutdown_drain_timeout_is_loaded_from_environment() -> None:
+    with patch.dict(
+        "os.environ",
+        {"SHUTDOWN_DRAIN_TIMEOUT_SECONDS": "12.5"},
+        clear=True,
+    ):
+        settings = load_settings()
+
+    assert settings.shutdown_drain_timeout_seconds == 12.5
+
+
 def test_semantic_cache_settings_are_loaded_from_environment() -> None:
     with patch.dict(
         "os.environ",

@@ -33,6 +33,7 @@ from services.provider_router import (
 )
 from services.queue import QueueFullError
 from services.retry import RetryExhaustedError, provider_status_code
+from services.shutdown import ShutdownDrain
 from services.usage import UsageTracker
 
 
@@ -143,6 +144,7 @@ def create_router(
     cache: ResponseCache | None = None,
     circuit_breaker: CircuitBreaker | None = None,
     usage_tracker: UsageTracker | None = None,
+    shutdown_drain: ShutdownDrain | None = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -434,8 +436,12 @@ def create_router(
                     )
                     yield "data: [DONE]\n\n"
 
+                stream = generate_cached()
+                if shutdown_drain is not None:
+                    stream = await shutdown_drain.track_stream(stream)
+
                 return StreamingResponse(
-                    generate_cached(),
+                    stream,
                     media_type="text/event-stream",
                     headers={
                         "x-trace-id": trace_id,
@@ -494,8 +500,12 @@ def create_router(
                     )
                     yield "data: [DONE]\n\n"
 
+                stream = generate_semantic_cached()
+                if shutdown_drain is not None:
+                    stream = await shutdown_drain.track_stream(stream)
+
                 return StreamingResponse(
-                    generate_semantic_cached(),
+                    stream,
                     media_type="text/event-stream",
                     headers={
                         "x-trace-id": trace_id,
@@ -761,8 +771,12 @@ def create_router(
                 # Ensure cleanup even if the parent task is cancelled.
                 item.cancelled = True
 
+        stream = generate()
+        if shutdown_drain is not None:
+            stream = await shutdown_drain.track_stream(stream)
+
         return StreamingResponse(
-            generate(),
+            stream,
             media_type="text/event-stream",
             headers={
                 **({"x-trace-id": trace_id}),
