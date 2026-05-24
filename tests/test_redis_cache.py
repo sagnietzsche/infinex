@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -290,7 +289,6 @@ class CacheIntegrationTests(unittest.IsolatedAsyncioTestCase):
         return cache
 
     async def test_non_streaming_cache_hit_skips_batcher(self) -> None:
-        from core.models import ChatCompletionResponse
         from services.batcher import AsyncRequestBatcher
         from api.routes import create_router
         from fastapi.testclient import TestClient
@@ -389,7 +387,6 @@ class CacheIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_non_streaming_cache_miss_calls_batcher_and_stores(self) -> None:
         import json as _json
-        from core.models import ChatMessage
         from services.batcher import AsyncRequestBatcher
         from api.routes import create_router
         from fastapi.testclient import TestClient

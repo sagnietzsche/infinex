@@ -2,7 +2,7 @@ import asyncio
 import unittest
 
 from core.models import ChatCompletionRequest, ChatMessage
-from services.batcher import DynamicBatcher, _StreamItem
+from services.batcher import DynamicBatcher
 
 
 def _request(prompt: str) -> ChatCompletionRequest:
