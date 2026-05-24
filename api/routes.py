@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from core.models import (
     ChatCompletionRequest,
     ChatCompletionResponse,
+    CompletionUsage,
     build_chat_completion_response,
 )
 from services.batcher import AsyncRequestBatcher, BatcherStats, DynamicBatcher
@@ -31,12 +32,81 @@ from services.provider_router import (
 )
 from services.queue import QueueFullError
 from services.retry import RetryExhaustedError, provider_status_code
+from services.usage import UsageTotals, UsageTracker
 
 
 logger = logging.getLogger(__name__)
 _RETRY_ATTEMPTED_HEADER = "X-Retries-Attempted"
 _PROVIDER_USED_HEADER = "X-Provider-Used"
 _NO_STREAM_ITEM = object()
+
+
+def _zero_usage() -> dict[str, int | float]:
+    return {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "estimated_cost_usd": 0.0,
+    }
+
+
+def _start_prompt_count(
+    usage_tracker: UsageTracker | None,
+    body: ChatCompletionRequest,
+) -> asyncio.Task[int] | int:
+    if usage_tracker is None:
+        return 0
+    task = asyncio.create_task(
+        usage_tracker.count_prompt_tokens(body),
+        name="usage-prompt-token-count",
+    )
+    task.add_done_callback(_consume_task_exception)
+    return task
+
+
+def _schedule_usage_record(
+    usage_tracker: UsageTracker | None,
+    *,
+    api_key: str | None,
+    model: str,
+    prompt_tokens: int | asyncio.Task[int],
+    completion_text: str,
+    completion_usage: CompletionUsage | None,
+    log_fields: dict[str, object],
+) -> None:
+    if usage_tracker is None:
+        log_event(logger, "request.completed", **log_fields, **_zero_usage())
+        return
+
+    task = asyncio.create_task(
+        usage_tracker.record_request(
+            api_key=api_key,
+            model=model,
+            prompt_tokens=prompt_tokens,
+            completion_text=completion_text,
+            completion_usage=completion_usage,
+            log_fields=log_fields,
+        ),
+        name="usage-record-request",
+    )
+    task.add_done_callback(_consume_task_exception)
+
+
+def _usage_response(usage: UsageTotals) -> dict[str, int | float]:
+    return {
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens,
+        "estimated_cost_usd": usage.estimated_cost_usd,
+    }
+
+
+def _consume_task_exception(task: asyncio.Task[object]) -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("background task failed: %r", exc)
 
 
 def _raise_retry_exhausted(exc: RetryExhaustedError, *, trace_id: str) -> None:
@@ -66,6 +136,7 @@ def create_router(
     streaming_batcher: DynamicBatcher,
     cache: ResponseCache | None = None,
     circuit_breaker: CircuitBreaker | None = None,
+    usage_tracker: UsageTracker | None = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -89,6 +160,12 @@ def create_router(
     async def stats() -> BatcherStats:
         return batcher.stats()
 
+    @router.get("/admin/keys/{key}/usage")
+    async def key_usage(key: str) -> dict[str, int | float]:
+        if usage_tracker is None:
+            return _zero_usage()
+        return _usage_response(await usage_tracker.get_usage(key))
+
     @router.post("/v1/chat/completions", response_model=None)
     async def chat_completions(
         body: ChatCompletionRequest,
@@ -98,6 +175,8 @@ def create_router(
         trace_id = request.headers.get("x-trace-id") or uuid4().hex
         response.headers["x-trace-id"] = trace_id
         started_at = perf_counter()
+        api_key = request.headers.get("x-api-key")
+        prompt_tokens = _start_prompt_count(usage_tracker, body)
         record_request(endpoint="chat_completions", stream=body.stream)
         log_event(
             logger,
@@ -115,24 +194,30 @@ def create_router(
                 record_cache_lookup(hit=cached is not None)
                 if cached is not None:
                     content = "".join(cached)
-                    prompt_tokens = sum(
-                        len(m.content.split()) for m in body.messages
+                    response_prompt_tokens = sum(
+                        len(message.content.split()) for message in body.messages
                     )
                     observe_latency(
                         operation="http_chat_completion",
                         seconds=perf_counter() - started_at,
                     )
-                    log_event(
-                        logger,
-                        "request.completed",
-                        trace_id=trace_id,
-                        cache_hit=True,
-                        stream=False,
+                    _schedule_usage_record(
+                        usage_tracker,
+                        api_key=api_key,
+                        model=body.model,
+                        prompt_tokens=prompt_tokens,
+                        completion_text=content,
+                        completion_usage=None,
+                        log_fields={
+                            "trace_id": trace_id,
+                            "cache_hit": True,
+                            "stream": False,
+                        },
                     )
                     return build_chat_completion_response(
                         model=body.model,
                         content=content,
-                        prompt_tokens=prompt_tokens,
+                        prompt_tokens=response_prompt_tokens,
                     )
 
             try:
@@ -215,12 +300,18 @@ def create_router(
                 operation="http_chat_completion",
                 seconds=perf_counter() - started_at,
             )
-            log_event(
-                logger,
-                "request.completed",
-                trace_id=trace_id,
-                cache_hit=False,
-                stream=False,
+            _schedule_usage_record(
+                usage_tracker,
+                api_key=api_key,
+                model=result.model,
+                prompt_tokens=prompt_tokens,
+                completion_text=result.choices[0].message.content,
+                completion_usage=result.usage,
+                log_fields={
+                    "trace_id": trace_id,
+                    "cache_hit": False,
+                    "stream": False,
+                },
             )
             return result
 
@@ -254,12 +345,18 @@ def create_router(
                         operation="http_chat_completion_stream",
                         seconds=perf_counter() - started_at,
                     )
-                    log_event(
-                        logger,
-                        "request.completed",
-                        trace_id=trace_id,
-                        cache_hit=True,
-                        stream=True,
+                    _schedule_usage_record(
+                        usage_tracker,
+                        api_key=api_key,
+                        model=body.model,
+                        prompt_tokens=prompt_tokens,
+                        completion_text="".join(cached),
+                        completion_usage=None,
+                        log_fields={
+                            "trace_id": trace_id,
+                            "cache_hit": True,
+                            "stream": True,
+                        },
                     )
                     yield "data: [DONE]\n\n"
 
@@ -486,12 +583,18 @@ def create_router(
                     operation="http_chat_completion_stream",
                     seconds=perf_counter() - started_at,
                 )
-                log_event(
-                    logger,
-                    "request.completed",
-                    trace_id=trace_id,
-                    cache_hit=False,
-                    stream=True,
+                _schedule_usage_record(
+                    usage_tracker,
+                    api_key=api_key,
+                    model=stream_model,
+                    prompt_tokens=prompt_tokens,
+                    completion_text="".join(collected),
+                    completion_usage=None,
+                    log_fields={
+                        "trace_id": trace_id,
+                        "cache_hit": False,
+                        "stream": True,
+                    },
                 )
                 yield "data: [DONE]\n\n"
             finally:

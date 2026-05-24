@@ -8,6 +8,17 @@ PROVIDER_MODEL_MAPPINGS: dict[str, str] = {
 }
 
 
+MODEL_PRICING_USD_PER_1K_TOKENS: dict[str, dict[str, float]] = {
+    "gateway-echo": {"input": 0.0, "output": 0.0},
+    "gpt-4o": {"input": 0.0025, "output": 0.01},
+    "gpt-4o-mini": {"input": 0.00015, "output": 0.0006},
+    "claude-opus-4-5": {"input": 0.015, "output": 0.075},
+    "claude-3-5-sonnet-latest": {"input": 0.003, "output": 0.015},
+    "gemini-1.5-pro": {"input": 0.00125, "output": 0.005},
+    "gemini-1.5-flash": {"input": 0.000075, "output": 0.0003},
+}
+
+
 @dataclass(frozen=True)
 class Settings:
     app_name: str = "llm-gateway"

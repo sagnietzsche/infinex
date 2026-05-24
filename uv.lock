@@ -798,6 +798,7 @@ dependencies = [
     { name = "litellm" },
     { name = "prometheus-client" },
     { name = "redis" },
+    { name = "tiktoken" },
 ]
 
 [package.dev-dependencies]
@@ -812,6 +813,7 @@ requires-dist = [
     { name = "litellm", specifier = ">=1.85.1" },
     { name = "prometheus-client", specifier = ">=0.25.0" },
     { name = "redis", specifier = ">=5.0.0" },
+    { name = "tiktoken", specifier = ">=0.13.0" },
 ]
 
 [package.metadata.requires-dev]
