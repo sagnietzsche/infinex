@@ -38,6 +38,11 @@ class Settings:
     redis_url: str = "redis://localhost:6379"
     cache_ttl_seconds: int = 3600
     cache_enabled: bool = True
+    semantic_cache_enabled: bool = True
+    semantic_cache_ttl_seconds: int = 3600
+    semantic_cache_threshold: float = 0.95
+    semantic_cache_embedding_model: str = "text-embedding-3-small"
+    semantic_cache_embedding_dimension: int = 1536
     allowed_api_keys: tuple[str, ...] = ()
     rate_limit_capacity: int = 60
     rate_limit_refill_per_second: float = 1.0
@@ -149,6 +154,9 @@ def load_settings() -> Settings:
     provider_fallback_chain = tuple(
         provider.lower() for provider in _read_csv("PROVIDER_FALLBACK_CHAIN")
     )
+    semantic_cache_enabled = (
+        os.getenv("SEMANTIC_CACHE_ENABLED", "true").lower() != "false"
+    )
     provider = (
         provider_fallback_chain[0]
         if provider_fallback_chain
@@ -177,7 +185,7 @@ def load_settings() -> Settings:
         provider_fallback_chain=provider_fallback_chain,
         openai_api_key=(
             os.getenv("OPENAI_API_KEY")
-            if "openai" in configured_providers
+            if "openai" in configured_providers or semantic_cache_enabled
             else None
         ),
         anthropic_api_key=(
@@ -196,6 +204,23 @@ def load_settings() -> Settings:
             "CACHE_TTL_SECONDS", Settings.cache_ttl_seconds
         ),
         cache_enabled=os.getenv("CACHE_ENABLED", "true").lower() != "false",
+        semantic_cache_enabled=semantic_cache_enabled,
+        semantic_cache_ttl_seconds=_read_positive_int(
+            "SEMANTIC_CACHE_TTL_SECONDS",
+            Settings.semantic_cache_ttl_seconds,
+        ),
+        semantic_cache_threshold=_read_threshold(
+            "SEMANTIC_CACHE_THRESHOLD",
+            Settings.semantic_cache_threshold,
+        ),
+        semantic_cache_embedding_model=os.getenv(
+            "SEMANTIC_CACHE_EMBEDDING_MODEL",
+            Settings.semantic_cache_embedding_model,
+        ),
+        semantic_cache_embedding_dimension=_read_positive_int(
+            "SEMANTIC_CACHE_EMBEDDING_DIMENSION",
+            Settings.semantic_cache_embedding_dimension,
+        ),
         allowed_api_keys=_read_csv("API_KEYS"),
         rate_limit_capacity=_read_positive_int(
             "RATE_LIMIT_CAPACITY", Settings.rate_limit_capacity

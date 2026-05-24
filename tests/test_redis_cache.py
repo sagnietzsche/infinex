@@ -5,7 +5,13 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from core.models import ChatCompletionRequest, ChatMessage
-from services.cache import ResponseCache, make_cache_key
+from services.cache import (
+    ResponseCache,
+    SemanticCacheLookup,
+    make_cache_key,
+    make_semantic_request_signature,
+    user_facing_prompt,
+)
 
 
 def _request(prompt: str, **kwargs) -> ChatCompletionRequest:
@@ -45,6 +51,23 @@ class MakeCacheKeyTests(unittest.TestCase):
     def test_key_has_expected_prefix(self) -> None:
         key = make_cache_key(_request("hello"))
         self.assertTrue(key.startswith("llm-gateway:v1:"))
+
+    def test_user_facing_prompt_excludes_system_messages(self) -> None:
+        req = ChatCompletionRequest(
+            messages=[
+                ChatMessage(role="system", content="answer like a pirate"),
+                ChatMessage(role="user", content="hello"),
+                ChatMessage(role="assistant", content="old answer"),
+                ChatMessage(role="user", content="world"),
+            ]
+        )
+
+        self.assertEqual(user_facing_prompt(req), "hello\nworld")
+
+
+class StaticEmbeddingProvider:
+    async def embed(self, text: str) -> list[float]:
+        return [1.0, 0.0, 0.0]
 
 
 class ResponseCacheTests(unittest.IsolatedAsyncioTestCase):
@@ -87,6 +110,110 @@ class ResponseCacheTests(unittest.IsolatedAsyncioTestCase):
         cache, mock_client = self._make_cache()
         await cache.close()
         mock_client.aclose.assert_called_once()
+
+    def _make_semantic_cache(self) -> tuple[ResponseCache, MagicMock, MagicMock]:
+        exact_client = MagicMock()
+        exact_client.get = AsyncMock(return_value=None)
+        exact_client.set = AsyncMock()
+        exact_client.aclose = AsyncMock()
+
+        semantic_client = MagicMock()
+        semantic_client.execute_command = AsyncMock()
+        semantic_client.hset = AsyncMock()
+        semantic_client.expire = AsyncMock()
+        semantic_client.aclose = AsyncMock()
+
+        with patch(
+            "services.cache.aioredis.from_url",
+            side_effect=[exact_client, semantic_client],
+        ):
+            cache = ResponseCache(
+                redis_url="redis://localhost:6379",
+                ttl_seconds=60,
+                semantic_enabled=True,
+                semantic_ttl_seconds=120,
+                semantic_threshold=0.95,
+                semantic_embedding_dimension=3,
+                embedding_provider=StaticEmbeddingProvider(),
+            )
+
+        return cache, exact_client, semantic_client
+
+    async def test_semantic_lookup_returns_hit_above_threshold(self) -> None:
+        cache, _, semantic_client = self._make_semantic_cache()
+        req = _request("hello")
+        signature = make_semantic_request_signature(req)
+        semantic_client.execute_command.side_effect = [
+            b"OK",
+            [
+                1,
+                b"llm-gateway:semantic:v1:item",
+                [
+                    b"chunks",
+                    b'["Echo: hello"]',
+                    b"score",
+                    b"0.02",
+                    b"expires_at",
+                    b"9999999999",
+                    b"request_signature",
+                    signature.encode(),
+                ],
+            ],
+        ]
+
+        result = await cache.lookup_semantic(req)
+
+        self.assertTrue(result.hit)
+        self.assertEqual(result.chunks, ["Echo: hello"])
+        self.assertAlmostEqual(result.similarity or 0, 0.98)
+
+    async def test_semantic_lookup_misses_below_threshold(self) -> None:
+        cache, _, semantic_client = self._make_semantic_cache()
+        req = _request("hello")
+        signature = make_semantic_request_signature(req)
+        semantic_client.execute_command.side_effect = [
+            b"OK",
+            [
+                1,
+                b"llm-gateway:semantic:v1:item",
+                [
+                    b"chunks",
+                    b'["Echo: hello"]',
+                    b"score",
+                    b"0.20",
+                    b"expires_at",
+                    b"9999999999",
+                    b"request_signature",
+                    signature.encode(),
+                ],
+            ],
+        ]
+
+        result = await cache.lookup_semantic(req)
+
+        self.assertFalse(result.hit)
+        self.assertEqual(result.embedding, [1.0, 0.0, 0.0])
+
+    async def test_set_semantic_stores_hash_with_ttl(self) -> None:
+        cache, _, semantic_client = self._make_semantic_cache()
+        semantic_client.execute_command.return_value = b"OK"
+
+        await cache.set_semantic(
+            "exact-key",
+            _request("hello"),
+            ["Echo: hello"],
+            prompt="hello",
+            embedding=[1.0, 0.0, 0.0],
+        )
+
+        semantic_client.hset.assert_called_once()
+        mapping = semantic_client.hset.call_args.kwargs["mapping"]
+        self.assertEqual(mapping["prompt"], "hello")
+        self.assertEqual(mapping["chunks"], '["Echo: hello"]')
+        self.assertEqual(len(mapping["embedding"]), 12)
+        semantic_client.expire.assert_called_once_with(
+            semantic_client.hset.call_args.args[0], 120
+        )
 
 
 class CacheIntegrationTests(unittest.IsolatedAsyncioTestCase):
@@ -146,9 +273,65 @@ class CacheIntegrationTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.headers["x-cache"], "HIT-EXACT")
         data = resp.json()
         self.assertEqual(data["choices"][0]["message"]["content"], "Echo: hello")
         mock_batcher.submit.assert_not_called()
+
+    async def test_non_streaming_semantic_cache_hit_skips_batcher(self) -> None:
+        from api.routes import create_router
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from services.batcher import AsyncRequestBatcher
+
+        cache = MagicMock()
+        cache.get = AsyncMock(return_value=None)
+        cache.lookup_semantic = AsyncMock(
+            return_value=SemanticCacheLookup(
+                prompt="hi",
+                embedding=[1.0, 0.0, 0.0],
+                chunks=["Echo: hello"],
+                similarity=0.98,
+            )
+        )
+        cache.set = AsyncMock()
+        cache.set_semantic = AsyncMock()
+
+        mock_batcher = MagicMock(spec=AsyncRequestBatcher)
+        mock_batcher.submit = AsyncMock()
+        mock_batcher.stats = MagicMock(
+            return_value=MagicMock(
+                queued_requests=0,
+                processed_requests=0,
+                processed_batches=0,
+                largest_batch_size=0,
+                max_batch_size=8,
+                max_wait_ms=25,
+            )
+        )
+        mock_streaming_batcher = MagicMock()
+
+        app = FastAPI()
+        app.include_router(create_router(mock_batcher, mock_streaming_batcher, cache))
+
+        with TestClient(app) as client:
+            resp = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "gateway-echo",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": False,
+                },
+            )
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.headers["x-cache"], "HIT-SEMANTIC")
+        self.assertEqual(
+            resp.json()["choices"][0]["message"]["content"], "Echo: hello"
+        )
+        mock_batcher.submit.assert_not_called()
+        cache.set.assert_called_once()
+        cache.set_semantic.assert_called_once()
 
     async def test_non_streaming_cache_miss_calls_batcher_and_stores(self) -> None:
         import json as _json
@@ -192,6 +375,7 @@ class CacheIntegrationTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.headers["x-cache"], "MISS")
         mock_batcher.submit.assert_called_once()
         cache._mock_client.set.assert_called_once()
         stored = _json.loads(cache._mock_client.set.call_args[0][1])

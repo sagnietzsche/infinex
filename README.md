@@ -57,9 +57,18 @@ During streaming, the response generator polls `request.is_disconnected()`. When
 
 `services/cache.py` caches completed responses in Redis, keyed by a SHA-256 hash of `(model, messages, temperature, max_tokens)`. Both the streaming and non-streaming paths check the cache before hitting the batcher. Cache hits replay stored chunks as SSE on the streaming path.
 
+The exact cache is checked first. On an exact miss, the gateway can also embed
+the user-facing prompt with `text-embedding-3-small` and query a Redis Stack
+HNSW vector index for recent near-duplicates. Semantic hits return the cached
+response without dispatching to the provider. Responses include `X-Cache` with
+`HIT-EXACT`, `HIT-SEMANTIC`, or `MISS`.
+
 ```bash
-# Run with caching enabled (requires Redis at localhost:6379)
+# Run with caching enabled (semantic caching requires Redis Stack + OPENAI_API_KEY)
 uv run python main.py
+
+# Disable semantic caching while keeping exact caching enabled
+SEMANTIC_CACHE_ENABLED=false uv run python main.py
 
 # Disable caching
 CACHE_ENABLED=false uv run python main.py
@@ -149,6 +158,11 @@ All settings are read from environment variables with the defaults shown below.
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL for cache, rate-limit, and circuit-breaker state |
 | `CACHE_TTL_SECONDS` | `3600` | Cache entry lifetime in seconds |
 | `CACHE_ENABLED` | `true` | Set to `false` to disable response caching |
+| `SEMANTIC_CACHE_ENABLED` | `true` | Set to `false` to disable near-duplicate semantic cache lookups while keeping exact cache enabled |
+| `SEMANTIC_CACHE_TTL_SECONDS` | `3600` | Semantic cache entry lifetime in seconds |
+| `SEMANTIC_CACHE_THRESHOLD` | `0.95` | Minimum cosine similarity required for a semantic cache hit; values over `1` are treated as percentages |
+| `SEMANTIC_CACHE_EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model used for semantic cache vectors |
+| `SEMANTIC_CACHE_EMBEDDING_DIMENSION` | `1536` | Vector dimension for the Redis Stack HNSW index |
 | `API_KEYS` | empty | Comma-separated allowed API keys. Empty disables auth/rate-limit middleware |
 | `RATE_LIMIT_CAPACITY` | `60` | Max burst size per API key |
 | `RATE_LIMIT_REFILL_PER_SECOND` | `1.0` | Tokens restored per second per API key |
