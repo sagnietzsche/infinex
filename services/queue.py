@@ -1,4 +1,5 @@
 import asyncio
+import heapq
 import json
 import logging
 import uuid
@@ -8,10 +9,33 @@ from typing import Any, Protocol
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 
-from services.observability import log_event, observe_latency, set_queue_depth
+from core.priority import (
+    PRIORITY_LEVELS,
+    PriorityLevel,
+    normalize_priority,
+    priority_rank,
+)
+from services.observability import (
+    log_event,
+    observe_latency,
+    set_queue_depth,
+    set_queue_depth_by_priority,
+)
 
 
 logger = logging.getLogger(__name__)
+
+
+def _set_priority_queue_depths(
+    queue_name: str, priorities: list[PriorityLevel]
+) -> None:
+    set_queue_depth(queue=queue_name, depth=len(priorities))
+    for priority in PRIORITY_LEVELS:
+        set_queue_depth_by_priority(
+            queue=queue_name,
+            priority=priority,
+            depth=priorities.count(priority),
+        )
 
 
 class QueueFullError(Exception):
@@ -24,6 +48,7 @@ class RequestItem:
     future: asyncio.Future[Any]
     request_id: str
     trace_id: str | None = None
+    priority: PriorityLevel = "normal"
 
 
 class RequestQueueProtocol(Protocol):
@@ -49,68 +74,102 @@ class InMemoryRequestQueue:
         if maxsize < 1:
             raise ValueError("maxsize must be greater than 0")
 
-        self._queue: asyncio.Queue[RequestItem] = asyncio.Queue(maxsize=maxsize)
+        self._maxsize = maxsize
+        self._queue: list[tuple[int, float, int, RequestItem]] = []
+        self._sequence = 0
+        self._lock = asyncio.Lock()
+        self._not_empty = asyncio.Condition(self._lock)
         self._metrics_queue_name = "memory_request_queue"
-        set_queue_depth(queue=self._metrics_queue_name, depth=0)
+        _set_priority_queue_depths(self._metrics_queue_name, [])
 
     @property
     def maxsize(self) -> int:
-        return self._queue.maxsize
+        return self._maxsize
 
     @property
     def size(self) -> int:
-        return self._queue.qsize()
+        return len(self._queue)
 
     async def enqueue(self, payload: dict[str, Any]) -> RequestItem:
         future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
         trace_id = _trace_id_from_payload(payload)
+        priority = _priority_from_payload(payload)
         item = RequestItem(
             payload=payload,
             future=future,
             request_id=str(uuid.uuid4()),
             trace_id=trace_id,
+            priority=priority,
         )
 
-        try:
-            self._queue.put_nowait(item)
-        except asyncio.QueueFull as exc:
-            future.cancel()
-            log_event(
-                logger,
-                "queue.enqueue_rejected",
-                trace_id=trace_id,
-                request_id=item.request_id,
-                queue=self._metrics_queue_name,
-                queue_depth=self._queue.qsize(),
-            )
-            raise QueueFullError("request queue is full") from exc
+        async with self._not_empty:
+            if len(self._queue) >= self._maxsize:
+                future.cancel()
+                log_event(
+                    logger,
+                    "queue.enqueue_rejected",
+                    trace_id=trace_id,
+                    request_id=item.request_id,
+                    queue=self._metrics_queue_name,
+                    queue_depth=len(self._queue),
+                    priority=priority,
+                )
+                raise QueueFullError("request queue is full")
 
-        set_queue_depth(queue=self._metrics_queue_name, depth=self._queue.qsize())
+            enqueued_at = asyncio.get_running_loop().time()
+            heapq.heappush(
+                self._queue,
+                (
+                    priority_rank(priority),
+                    enqueued_at,
+                    self._sequence,
+                    item,
+                ),
+            )
+            self._sequence += 1
+            _set_priority_queue_depths(
+                self._metrics_queue_name,
+                [entry[3].priority for entry in self._queue],
+            )
+            queue_depth = len(self._queue)
+            self._not_empty.notify()
+
         log_event(
             logger,
             "queue.enqueue",
             trace_id=trace_id,
             request_id=item.request_id,
             queue=self._metrics_queue_name,
-            queue_depth=self._queue.qsize(),
+            queue_depth=queue_depth,
+            priority=priority,
         )
         return item
 
     async def get(self) -> RequestItem:
-        item = await self._queue.get()
-        set_queue_depth(queue=self._metrics_queue_name, depth=self._queue.qsize())
+        async with self._not_empty:
+            while not self._queue:
+                await self._not_empty.wait()
+
+            item = heapq.heappop(self._queue)[3]
+            _set_priority_queue_depths(
+                self._metrics_queue_name,
+                [entry[3].priority for entry in self._queue],
+            )
+            queue_depth = len(self._queue)
+
         log_event(
             logger,
             "queue.dequeue",
             trace_id=item.trace_id,
             request_id=item.request_id,
             queue=self._metrics_queue_name,
-            queue_depth=self._queue.qsize(),
+            queue_depth=queue_depth,
+            priority=item.priority,
         )
         return item
 
     def task_done(self) -> None:
-        self._queue.task_done()
+        return None
 
 
 class KafkaRequestQueue:
@@ -136,7 +195,7 @@ class KafkaRequestQueue:
         self._producer: Any | None = None
         self._pending: dict[str, RequestItem] = {}
         self._metrics_queue_name = "kafka_pending_requests"
-        set_queue_depth(queue=self._metrics_queue_name, depth=0)
+        _set_priority_queue_depths(self._metrics_queue_name, [])
 
     @property
     def maxsize(self) -> int:
@@ -157,7 +216,7 @@ class KafkaRequestQueue:
             if not item.future.done():
                 item.future.cancel()
         self._pending.clear()
-        set_queue_depth(queue=self._metrics_queue_name, depth=0)
+        _set_priority_queue_depths(self._metrics_queue_name, [])
 
         if self._producer is not None:
             await self._producer.stop()
@@ -168,26 +227,33 @@ class KafkaRequestQueue:
             raise RuntimeError("KafkaRequestQueue must be started before enqueue")
 
         if len(self._pending) >= self._maxsize:
+            priority = _priority_from_payload(payload)
             log_event(
                 logger,
                 "queue.enqueue_rejected",
                 trace_id=_trace_id_from_payload(payload),
                 queue=self._metrics_queue_name,
                 queue_depth=len(self._pending),
+                priority=priority,
             )
             raise QueueFullError("request queue is full")
 
         request_id = self._request_id_factory()
         future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
         trace_id = _trace_id_from_payload(payload)
+        priority = _priority_from_payload(payload)
         item = RequestItem(
             payload=payload,
             future=future,
             request_id=request_id,
             trace_id=trace_id,
+            priority=priority,
         )
         self._pending[request_id] = item
-        set_queue_depth(queue=self._metrics_queue_name, depth=len(self._pending))
+        _set_priority_queue_depths(
+            self._metrics_queue_name,
+            [pending_item.priority for pending_item in self._pending.values()],
+        )
         log_event(
             logger,
             "queue.enqueue",
@@ -195,6 +261,7 @@ class KafkaRequestQueue:
             request_id=request_id,
             queue=self._metrics_queue_name,
             queue_depth=len(self._pending),
+            priority=priority,
         )
 
         message = json.dumps(
@@ -214,7 +281,10 @@ class KafkaRequestQueue:
             )
         except Exception:
             self._pending.pop(request_id, None)
-            set_queue_depth(queue=self._metrics_queue_name, depth=len(self._pending))
+            _set_priority_queue_depths(
+                self._metrics_queue_name,
+                [pending_item.priority for pending_item in self._pending.values()],
+            )
             future.cancel()
             raise
 
@@ -225,7 +295,10 @@ class KafkaRequestQueue:
         if item is None:
             return False
 
-        set_queue_depth(queue=self._metrics_queue_name, depth=len(self._pending))
+        _set_priority_queue_depths(
+            self._metrics_queue_name,
+            [pending_item.priority for pending_item in self._pending.values()],
+        )
         if not item.future.done():
             item.future.set_result(response)
         log_event(
@@ -235,6 +308,7 @@ class KafkaRequestQueue:
             request_id=request_id,
             queue=self._metrics_queue_name,
             queue_depth=len(self._pending),
+            priority=item.priority,
         )
         return True
 
@@ -243,7 +317,10 @@ class KafkaRequestQueue:
         if item is None:
             return False
 
-        set_queue_depth(queue=self._metrics_queue_name, depth=len(self._pending))
+        _set_priority_queue_depths(
+            self._metrics_queue_name,
+            [pending_item.priority for pending_item in self._pending.values()],
+        )
         if not item.future.done():
             item.future.set_exception(exc)
         log_event(
@@ -253,6 +330,7 @@ class KafkaRequestQueue:
             request_id=request_id,
             queue=self._metrics_queue_name,
             queue_depth=len(self._pending),
+            priority=item.priority,
             error=repr(exc),
         )
         return True
@@ -505,6 +583,10 @@ async def execute_payload(
 def _trace_id_from_payload(payload: dict[str, Any]) -> str | None:
     trace_id = payload.get("trace_id")
     return trace_id if isinstance(trace_id, str) else None
+
+
+def _priority_from_payload(payload: dict[str, Any]) -> PriorityLevel:
+    return normalize_priority(payload.get("priority"))
 
 
 RequestQueue = InMemoryRequestQueue

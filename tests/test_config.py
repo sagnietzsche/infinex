@@ -155,3 +155,19 @@ def test_provider_fallback_chain_selects_primary_and_loads_chain_keys() -> None:
     assert settings.provider_fallback_chain == ("openai", "anthropic")
     assert settings.openai_api_key == "openai-key"
     assert settings.anthropic_api_key == "anthropic-key"
+
+
+def test_api_key_metadata_sets_premium_key_priority() -> None:
+    with patch.dict(
+        "os.environ",
+        {
+            "API_KEYS": "dev-key,premium-key:tier=premium,slow-key:priority=low",
+        },
+        clear=True,
+    ):
+        settings = load_settings()
+
+    assert settings.allowed_api_keys == ("dev-key", "premium-key", "slow-key")
+    assert settings.priority_for_api_key("premium-key") == "high"
+    assert settings.priority_for_api_key("slow-key") == "low"
+    assert settings.priority_for_api_key("dev-key") is None

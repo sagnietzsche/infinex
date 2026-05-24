@@ -21,6 +21,9 @@ The gateway addresses all of these at the middleware layer.
 `POST /v1/chat/completions` (non-streaming) queues requests and flushes them as a parallel batch when either `BATCH_MAX_SIZE` is reached or `BATCH_MAX_WAIT_MS` expires. Each caller receives its own response.
 The pending batch queue is bounded by `BATCH_QUEUE_MAX_SIZE`; when that queue is
 full the gateway returns `503` with `{"detail":"Request queue is full"}`.
+Requests can include `"priority": "low" | "normal" | "high"`; the default is
+`"normal"`. When there is a backlog, queued requests dispatch by priority first
+and enqueue age second, so older high-priority requests run before lower tiers.
 
 ```bash
 # Non-streaming completion
@@ -46,7 +49,7 @@ curl -s http://127.0.0.1:8000/v1/chat/completions \
 
 `services/queue.py` provides a bounded queue with backpressure. Two backends:
 
-- **`InMemoryRequestQueue`** — `asyncio.Queue`-backed, raises `QueueFullError` when at capacity.
+- **`InMemoryRequestQueue`** — heap-backed in-process queue, raises `QueueFullError` when at capacity.
 - **`KafkaRequestQueue`** — publishes requests to a Kafka topic, resolves futures when a matching response arrives on the reply topic. Suitable for distributed, multi-gateway deployments.
 
 #### 4. Client Disconnect Detection
@@ -81,6 +84,9 @@ When `API_KEYS` is configured, requests must include `X-API-Key` with one of the
 ```bash
 API_KEYS=dev-key RATE_LIMIT_CAPACITY=60 RATE_LIMIT_REFILL_PER_SECOND=1 uv run python main.py
 
+# Premium keys are accepted as normal auth keys and automatically get high priority.
+API_KEYS='dev-key,premium-key:tier=premium' uv run python main.py
+
 curl -s http://127.0.0.1:8000/v1/chat/completions \
   -H 'content-type: application/json' \
   -H 'x-api-key: dev-key' \
@@ -90,7 +96,8 @@ curl -s http://127.0.0.1:8000/v1/chat/completions \
 #### 7. Prometheus Metrics + Trace Logs
 
 Prometheus metrics are exposed at `/metrics`. The gateway tracks request volume,
-latency histograms, cache hit rate, current queue depth, and batch fill metrics.
+latency histograms, cache hit rate, current queue depth, queue depth per
+priority level, and batch fill metrics.
 
 ```bash
 curl -s http://127.0.0.1:8000/metrics
@@ -158,12 +165,7 @@ All settings are read from environment variables with the defaults shown below.
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL for cache, rate-limit, and circuit-breaker state |
 | `CACHE_TTL_SECONDS` | `3600` | Cache entry lifetime in seconds |
 | `CACHE_ENABLED` | `true` | Set to `false` to disable response caching |
-| `SEMANTIC_CACHE_ENABLED` | `true` | Set to `false` to disable near-duplicate semantic cache lookups while keeping exact cache enabled |
-| `SEMANTIC_CACHE_TTL_SECONDS` | `3600` | Semantic cache entry lifetime in seconds |
-| `SEMANTIC_CACHE_THRESHOLD` | `0.95` | Minimum cosine similarity required for a semantic cache hit; values over `1` are treated as percentages |
-| `SEMANTIC_CACHE_EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model used for semantic cache vectors |
-| `SEMANTIC_CACHE_EMBEDDING_DIMENSION` | `1536` | Vector dimension for the Redis Stack HNSW index |
-| `API_KEYS` | empty | Comma-separated allowed API keys. Empty disables auth/rate-limit middleware |
+| `API_KEYS` | empty | Comma-separated allowed API keys. Empty disables auth/rate-limit middleware. Entries can include metadata, e.g. `premium-key:tier=premium` for automatic high priority or `slow-key:priority=low` |
 | `RATE_LIMIT_CAPACITY` | `60` | Max burst size per API key |
 | `RATE_LIMIT_REFILL_PER_SECOND` | `1.0` | Tokens restored per second per API key |
 | `MAX_RETRIES` | `3` | Provider retry attempts after the first failed call |

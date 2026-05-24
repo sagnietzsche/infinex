@@ -6,6 +6,8 @@ from typing import Any
 
 from prometheus_client import Counter, Gauge, Histogram
 
+from core.priority import PriorityLevel
+
 
 REQUEST_COUNT = Counter(
     "request_count",
@@ -28,6 +30,12 @@ CURRENT_QUEUE_DEPTH = Gauge(
     "current_queue_depth",
     "Current queued item depth by queue or batcher.",
     ["queue"],
+)
+
+CURRENT_QUEUE_DEPTH_BY_PRIORITY = Gauge(
+    "current_queue_depth_by_priority",
+    "Current queued item depth by queue or batcher and priority level.",
+    ["queue", "priority"],
 )
 
 BATCH_SIZE = Histogram(
@@ -63,6 +71,15 @@ def record_cache_lookup(*, hit: bool) -> None:
 
 def set_queue_depth(*, queue: str, depth: int) -> None:
     CURRENT_QUEUE_DEPTH.labels(queue=queue).set(depth)
+
+
+def set_queue_depth_by_priority(
+    *, queue: str, priority: PriorityLevel, depth: int
+) -> None:
+    CURRENT_QUEUE_DEPTH_BY_PRIORITY.labels(
+        queue=queue,
+        priority=priority,
+    ).set(depth)
 
 
 def observe_latency(*, operation: str, seconds: float) -> None:

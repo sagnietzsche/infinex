@@ -15,6 +15,7 @@ from core.models import (
     CompletionUsage,
     build_chat_completion_response,
 )
+from core.priority import PriorityLevel
 from services.batcher import AsyncRequestBatcher, BatcherStats, DynamicBatcher
 from services.cache import ResponseCache, make_cache_key
 from services.circuit_breaker import CircuitBreaker
@@ -52,6 +53,15 @@ def _zero_usage() -> dict[str, int | float]:
         "total_tokens": 0,
         "estimated_cost_usd": 0.0,
     }
+
+
+def _effective_priority(
+    body: ChatCompletionRequest, request: Request
+) -> PriorityLevel:
+    api_key_priority = getattr(request.state, "api_key_priority", None)
+    if api_key_priority is not None:
+        return api_key_priority
+    return body.priority
 
 
 def _start_prompt_count(
@@ -181,6 +191,9 @@ def create_router(
         response.headers["x-trace-id"] = trace_id
         started_at = perf_counter()
         api_key = request.headers.get("x-api-key")
+        body = body.model_copy(
+            update={"priority": _effective_priority(body, request)}
+        )
         prompt_tokens = _start_prompt_count(usage_tracker, body)
         record_request(endpoint="chat_completions", stream=body.stream)
         log_event(
@@ -189,6 +202,7 @@ def create_router(
             trace_id=trace_id,
             path=str(request.url.path),
             stream=body.stream,
+            priority=body.priority,
         )
 
         if not body.stream:

@@ -2,6 +2,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 import os
 
+from core.priority import PriorityLevel, normalize_priority
+
 
 PROVIDER_MODEL_MAPPINGS: dict[str, str] = {
     "openai/gpt-4o": "anthropic/claude-opus-4-5",
@@ -44,6 +46,7 @@ class Settings:
     semantic_cache_embedding_model: str = "text-embedding-3-small"
     semantic_cache_embedding_dimension: int = 1536
     allowed_api_keys: tuple[str, ...] = ()
+    api_key_priorities: Mapping[str, PriorityLevel] = field(default_factory=dict)
     rate_limit_capacity: int = 60
     rate_limit_refill_per_second: float = 1.0
     max_retries: int = 3
@@ -66,6 +69,11 @@ class Settings:
         object.__setattr__(
             self, "provider_fallback_chain", provider_fallback_chain
         )
+
+    def priority_for_api_key(self, api_key: str | None) -> PriorityLevel | None:
+        if api_key is None:
+            return None
+        return self.api_key_priorities.get(api_key)
 
 
 def _read_positive_int(
@@ -150,7 +158,46 @@ def _read_csv(name: str) -> tuple[str, ...]:
     )
 
 
+def _parse_api_key_entry(entry: str) -> tuple[str, PriorityLevel | None]:
+    key, separator, raw_metadata = entry.partition(":")
+    if not separator:
+        key, separator, raw_metadata = entry.partition("|")
+    if not separator:
+        return entry, None
+
+    key = key.strip()
+    priority: PriorityLevel | None = None
+    for raw_field in raw_metadata.split(";"):
+        name, field_separator, value = raw_field.strip().partition("=")
+        if not field_separator:
+            continue
+        name = name.strip().lower()
+        value = value.strip().lower()
+        if name == "tier" and value == "premium":
+            priority = "high"
+        elif name == "priority":
+            priority = normalize_priority(value)
+
+    return key, priority
+
+
+def _read_api_keys() -> tuple[tuple[str, ...], dict[str, PriorityLevel]]:
+    allowed_keys: list[str] = []
+    api_key_priorities: dict[str, PriorityLevel] = {}
+
+    for entry in _read_csv("API_KEYS"):
+        key, priority = _parse_api_key_entry(entry)
+        if not key:
+            continue
+        allowed_keys.append(key)
+        if priority is not None:
+            api_key_priorities[key] = priority
+
+    return tuple(allowed_keys), api_key_priorities
+
+
 def load_settings() -> Settings:
+    allowed_api_keys, api_key_priorities = _read_api_keys()
     provider_fallback_chain = tuple(
         provider.lower() for provider in _read_csv("PROVIDER_FALLBACK_CHAIN")
     )
@@ -204,24 +251,8 @@ def load_settings() -> Settings:
             "CACHE_TTL_SECONDS", Settings.cache_ttl_seconds
         ),
         cache_enabled=os.getenv("CACHE_ENABLED", "true").lower() != "false",
-        semantic_cache_enabled=semantic_cache_enabled,
-        semantic_cache_ttl_seconds=_read_positive_int(
-            "SEMANTIC_CACHE_TTL_SECONDS",
-            Settings.semantic_cache_ttl_seconds,
-        ),
-        semantic_cache_threshold=_read_threshold(
-            "SEMANTIC_CACHE_THRESHOLD",
-            Settings.semantic_cache_threshold,
-        ),
-        semantic_cache_embedding_model=os.getenv(
-            "SEMANTIC_CACHE_EMBEDDING_MODEL",
-            Settings.semantic_cache_embedding_model,
-        ),
-        semantic_cache_embedding_dimension=_read_positive_int(
-            "SEMANTIC_CACHE_EMBEDDING_DIMENSION",
-            Settings.semantic_cache_embedding_dimension,
-        ),
-        allowed_api_keys=_read_csv("API_KEYS"),
+        allowed_api_keys=allowed_api_keys,
+        api_key_priorities=api_key_priorities,
         rate_limit_capacity=_read_positive_int(
             "RATE_LIMIT_CAPACITY", Settings.rate_limit_capacity
         ),

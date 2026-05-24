@@ -23,6 +23,7 @@ def test_metrics_endpoint_exports_gateway_metrics() -> None:
     assert "latency_histogram_bucket" in body
     assert "cache_hit_rate" in body
     assert "current_queue_depth" in body
+    assert "current_queue_depth_by_priority" in body
 
 
 def test_structured_logs_include_trace_id_and_batcher_id(caplog) -> None:

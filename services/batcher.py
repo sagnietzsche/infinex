@@ -3,21 +3,36 @@ from __future__ import annotations
 import asyncio
 from contextlib import aclosing
 from dataclasses import dataclass, field
+import heapq
 import logging
 from uuid import uuid4
 
 from core.models import ChatCompletionRequest, ChatCompletionResponse
+from core.priority import PRIORITY_LEVELS, PriorityLevel, priority_rank
 from infra.providers import LLMProvider, StreamingLLMProvider
 from services.observability import (
     log_event,
     observe_batch,
     observe_latency,
     set_queue_depth,
+    set_queue_depth_by_priority,
 )
 from services.queue import QueueFullError
 
 
 logger = logging.getLogger(__name__)
+
+
+def _set_priority_queue_depths(
+    queue_name: str, priorities: list[PriorityLevel]
+) -> None:
+    set_queue_depth(queue=queue_name, depth=len(priorities))
+    for priority in PRIORITY_LEVELS:
+        set_queue_depth_by_priority(
+            queue=queue_name,
+            priority=priority,
+            depth=priorities.count(priority),
+        )
 
 
 @dataclass
@@ -37,6 +52,7 @@ class _QueuedRequest:
     future: asyncio.Future[ChatCompletionResponse]
     trace_id: str
     enqueued_at: float
+    priority: PriorityLevel = "normal"
 
 
 class AsyncRequestBatcher:
@@ -60,7 +76,8 @@ class AsyncRequestBatcher:
         self._max_wait_ms = max_wait_ms
         self._max_queue_size = max_queue_size
         self._max_wait_seconds = max_wait_ms / 1000
-        self._queue: list[_QueuedRequest] = []
+        self._queue: list[tuple[int, float, int, _QueuedRequest]] = []
+        self._sequence = 0
         self._lock = asyncio.Lock()
         self._flush_handle: asyncio.TimerHandle | None = None
         self._closed = False
@@ -69,7 +86,7 @@ class AsyncRequestBatcher:
         self._largest_batch_size = 0
         self._batcher_id = f"async-{uuid4().hex[:8]}"
         self._metrics_queue_name = "async_batcher"
-        set_queue_depth(queue=self._metrics_queue_name, depth=0)
+        _set_priority_queue_depths(self._metrics_queue_name, [])
 
     async def submit(
         self, request: ChatCompletionRequest, trace_id: str | None = None
@@ -85,9 +102,9 @@ class AsyncRequestBatcher:
 
             if len(self._queue) >= self._max_queue_size:
                 future.cancel()
-                set_queue_depth(
-                    queue=self._metrics_queue_name,
-                    depth=len(self._queue),
+                _set_priority_queue_depths(
+                    self._metrics_queue_name,
+                    [entry[3].priority for entry in self._queue],
                 )
                 log_event(
                     logger,
@@ -96,26 +113,41 @@ class AsyncRequestBatcher:
                     batcher_id=self._batcher_id,
                     queue_depth=len(self._queue),
                     max_queue_size=self._max_queue_size,
+                    priority=request.priority,
                     stream=False,
                 )
                 raise QueueFullError("request queue is full")
 
-            self._queue.append(
-                _QueuedRequest(
-                    request=request,
-                    future=future,
-                    trace_id=trace_id,
-                    enqueued_at=loop.time(),
-                )
+            enqueued_at = loop.time()
+            queued_request = _QueuedRequest(
+                request=request,
+                future=future,
+                trace_id=trace_id,
+                enqueued_at=enqueued_at,
+                priority=request.priority,
             )
+            heapq.heappush(
+                self._queue,
+                (
+                    priority_rank(request.priority),
+                    enqueued_at,
+                    self._sequence,
+                    queued_request,
+                ),
+            )
+            self._sequence += 1
             queue_depth = len(self._queue)
-            set_queue_depth(queue=self._metrics_queue_name, depth=queue_depth)
+            _set_priority_queue_depths(
+                self._metrics_queue_name,
+                [entry[3].priority for entry in self._queue],
+            )
             log_event(
                 logger,
                 "batcher.enqueue",
                 trace_id=trace_id,
                 batcher_id=self._batcher_id,
                 queue_depth=queue_depth,
+                priority=request.priority,
                 stream=False,
             )
 
@@ -134,9 +166,11 @@ class AsyncRequestBatcher:
 
     async def flush(self) -> None:
         async with self._lock:
-            batch = self._queue
+            batch = [
+                heapq.heappop(self._queue)[3] for _ in range(len(self._queue))
+            ]
             self._queue = []
-            set_queue_depth(queue=self._metrics_queue_name, depth=0)
+            _set_priority_queue_depths(self._metrics_queue_name, [])
 
             if self._flush_handle is not None:
                 self._flush_handle.cancel()
@@ -251,6 +285,7 @@ class _StreamItem:
     request: ChatCompletionRequest
     trace_id: str
     enqueued_at: float
+    priority: PriorityLevel = "normal"
     cancelled: bool = False
     response_channel: asyncio.Queue[object] = field(
         default_factory=asyncio.Queue
@@ -287,9 +322,10 @@ class DynamicBatcher:
         self._max_wait_ms = max_wait_ms
         self._max_queue_size = max_queue_size
         self._max_wait_seconds = max_wait_ms / 1000
-        self._input_queue: asyncio.Queue[_StreamItem] = asyncio.Queue(
-            maxsize=max_queue_size
-        )
+        self._input_queue: list[tuple[int, float, int, _StreamItem]] = []
+        self._sequence = 0
+        self._lock = asyncio.Lock()
+        self._not_empty = asyncio.Condition(self._lock)
         self._task: asyncio.Task[None] | None = None
         self._closed = False
         self._processed_requests = 0
@@ -297,7 +333,7 @@ class DynamicBatcher:
         self._largest_batch_size = 0
         self._batcher_id = f"dynamic-{uuid4().hex[:8]}"
         self._metrics_queue_name = "dynamic_batcher"
-        set_queue_depth(queue=self._metrics_queue_name, depth=0)
+        _set_priority_queue_depths(self._metrics_queue_name, [])
 
     def start(self) -> None:
         if self._task is not None and not self._task.done():
@@ -315,32 +351,50 @@ class DynamicBatcher:
             request=request,
             trace_id=trace_id,
             enqueued_at=loop.time(),
+            priority=request.priority,
         )
-        try:
-            self._input_queue.put_nowait(item)
-        except asyncio.QueueFull as exc:
-            set_queue_depth(
-                queue=self._metrics_queue_name,
-                depth=self._input_queue.qsize(),
+        async with self._not_empty:
+            if len(self._input_queue) >= self._max_queue_size:
+                _set_priority_queue_depths(
+                    self._metrics_queue_name,
+                    [entry[3].priority for entry in self._input_queue],
+                )
+                log_event(
+                    logger,
+                    "batcher.enqueue_rejected",
+                    trace_id=trace_id,
+                    batcher_id=self._batcher_id,
+                    queue_depth=len(self._input_queue),
+                    max_queue_size=self._max_queue_size,
+                    priority=request.priority,
+                    stream=True,
+                )
+                raise QueueFullError("request queue is full")
+
+            heapq.heappush(
+                self._input_queue,
+                (
+                    priority_rank(request.priority),
+                    item.enqueued_at,
+                    self._sequence,
+                    item,
+                ),
             )
-            log_event(
-                logger,
-                "batcher.enqueue_rejected",
-                trace_id=trace_id,
-                batcher_id=self._batcher_id,
-                queue_depth=self._input_queue.qsize(),
-                max_queue_size=self._max_queue_size,
-                stream=True,
+            self._sequence += 1
+            queue_depth = len(self._input_queue)
+            _set_priority_queue_depths(
+                self._metrics_queue_name,
+                [entry[3].priority for entry in self._input_queue],
             )
-            raise QueueFullError("request queue is full") from exc
-        queue_depth = self._input_queue.qsize()
-        set_queue_depth(queue=self._metrics_queue_name, depth=queue_depth)
+            self._not_empty.notify()
+
         log_event(
             logger,
             "batcher.enqueue",
             trace_id=trace_id,
             batcher_id=self._batcher_id,
             queue_depth=queue_depth,
+            priority=request.priority,
             stream=True,
         )
         return item
@@ -353,22 +407,21 @@ class DynamicBatcher:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        pending: list[_StreamItem] = []
+        async with self._not_empty:
+            while self._input_queue:
+                pending.append(heapq.heappop(self._input_queue)[3])
+            _set_priority_queue_depths(self._metrics_queue_name, [])
+            self._not_empty.notify_all()
+
         # Signal closure to any requests still waiting in the input queue.
-        while not self._input_queue.empty():
-            try:
-                item = self._input_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            set_queue_depth(
-                queue=self._metrics_queue_name,
-                depth=self._input_queue.qsize(),
-            )
+        for item in pending:
             await item.response_channel.put(RuntimeError("batcher is closed"))
             await item.response_channel.put(None)
 
     def stats(self) -> DynamicBatcherStats:
         return DynamicBatcherStats(
-            queued_requests=self._input_queue.qsize(),
+            queued_requests=len(self._input_queue),
             processed_requests=self._processed_requests,
             processed_batches=self._processed_batches,
             largest_batch_size=self._largest_batch_size,
@@ -377,14 +430,38 @@ class DynamicBatcher:
             max_queue_size=self._max_queue_size,
         )
 
+    async def _get_next_item(self, *, timeout: float | None = None) -> _StreamItem:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout if timeout is not None else None
+
+        async with self._not_empty:
+            while not self._input_queue:
+                if deadline is None:
+                    await self._not_empty.wait()
+                    continue
+
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+
+                try:
+                    await asyncio.wait_for(
+                        self._not_empty.wait(), timeout=remaining
+                    )
+                except asyncio.TimeoutError:
+                    raise
+
+            item = heapq.heappop(self._input_queue)[3]
+            _set_priority_queue_depths(
+                self._metrics_queue_name,
+                [entry[3].priority for entry in self._input_queue],
+            )
+            return item
+
     async def _run(self) -> None:
         while True:
             # Block until the first request of the next batch arrives.
-            first = await self._input_queue.get()
-            set_queue_depth(
-                queue=self._metrics_queue_name,
-                depth=self._input_queue.qsize(),
-            )
+            first = await self._get_next_item()
             batch: list[_StreamItem] = [first]
 
             # Open a MAX_WAIT_MS window to accumulate additional requests.
@@ -394,16 +471,14 @@ class DynamicBatcher:
                 if remaining <= 0:
                     break
                 try:
-                    item = await asyncio.wait_for(
-                        self._input_queue.get(), timeout=remaining
-                    )
+                    item = await self._get_next_item(timeout=remaining)
                     batch.append(item)
-                    set_queue_depth(
-                        queue=self._metrics_queue_name,
-                        depth=self._input_queue.qsize(),
-                    )
                 except asyncio.TimeoutError:
                     break
+
+            batch.sort(
+                key=lambda item: (priority_rank(item.priority), item.enqueued_at)
+            )
 
             loop = asyncio.get_running_loop()
             batch_id = f"batch-{uuid4().hex[:8]}"
