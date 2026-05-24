@@ -76,6 +76,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ResponseCache(
             redis_url=settings.redis_url,
             ttl_seconds=settings.cache_ttl_seconds,
+            semantic_enabled=settings.semantic_cache_enabled,
+            semantic_ttl_seconds=settings.semantic_cache_ttl_seconds,
+            semantic_threshold=settings.semantic_cache_threshold,
+            semantic_embedding_model=settings.semantic_cache_embedding_model,
+            semantic_embedding_dimension=(
+                settings.semantic_cache_embedding_dimension
+            ),
+            openai_api_key=settings.openai_api_key,
         )
         if settings.cache_enabled
         else None

@@ -39,6 +39,10 @@ from services.usage import UsageTotals, UsageTracker
 logger = logging.getLogger(__name__)
 _RETRY_ATTEMPTED_HEADER = "X-Retries-Attempted"
 _PROVIDER_USED_HEADER = "X-Provider-Used"
+_CACHE_HEADER = "X-Cache"
+_CACHE_HIT_EXACT = "HIT-EXACT"
+_CACHE_HIT_SEMANTIC = "HIT-SEMANTIC"
+_CACHE_MISS = "MISS"
 _NO_STREAM_ITEM = object()
 
 
@@ -123,6 +127,7 @@ def _raise_retry_exhausted(exc: RetryExhaustedError, *, trace_id: str) -> None:
     headers = {
         _RETRY_ATTEMPTED_HEADER: str(exc.retries_attempted),
         "x-trace-id": trace_id,
+        _CACHE_HEADER: _CACHE_MISS,
     }
     original = exc.original
 
@@ -202,11 +207,13 @@ def create_router(
 
         if not body.stream:
             cache_key = make_cache_key(body) if cache is not None else None
+            semantic_lookup = None
 
             if cache_key is not None:
                 cached = await cache.get(cache_key)
-                record_cache_lookup(hit=cached is not None)
                 if cached is not None:
+                    response.headers[_CACHE_HEADER] = _CACHE_HIT_EXACT
+                    record_cache_lookup(hit=True)
                     content = "".join(cached)
                     response_prompt_tokens = sum(
                         len(message.content.split()) for message in body.messages
@@ -234,6 +241,51 @@ def create_router(
                         prompt_tokens=response_prompt_tokens,
                     )
 
+                semantic_lookup = await cache.lookup_semantic(body)
+                if semantic_lookup.hit:
+                    response.headers[_CACHE_HEADER] = _CACHE_HIT_SEMANTIC
+                    record_cache_lookup(hit=True)
+                    assert semantic_lookup.chunks is not None
+                    await cache.set(cache_key, semantic_lookup.chunks)
+                    await cache.set_semantic(
+                        cache_key,
+                        body,
+                        semantic_lookup.chunks,
+                        prompt=semantic_lookup.prompt,
+                        embedding=semantic_lookup.embedding,
+                    )
+                    content = "".join(semantic_lookup.chunks)
+                    response_prompt_tokens = sum(
+                        len(message.content.split()) for message in body.messages
+                    )
+                    observe_latency(
+                        operation="http_chat_completion",
+                        seconds=perf_counter() - started_at,
+                    )
+                    _schedule_usage_record(
+                        usage_tracker,
+                        api_key=api_key,
+                        model=body.model,
+                        prompt_tokens=prompt_tokens,
+                        completion_text=content,
+                        completion_usage=None,
+                        log_fields={
+                            "trace_id": trace_id,
+                            "cache_hit": True,
+                            "cache_hit_type": "semantic",
+                            "stream": False,
+                        },
+                    )
+                    return build_chat_completion_response(
+                        model=body.model,
+                        content=content,
+                        prompt_tokens=response_prompt_tokens,
+                    )
+
+            response.headers[_CACHE_HEADER] = _CACHE_MISS
+            if cache_key is not None:
+                record_cache_lookup(hit=False)
+
             try:
                 result = await batcher.submit(body, trace_id=trace_id)
             except QueueFullError as exc:
@@ -253,6 +305,7 @@ def create_router(
                 raise HTTPException(
                     status_code=503,
                     detail="Request queue is full",
+                    headers={_CACHE_HEADER: _CACHE_MISS},
                 ) from exc
             except RetryExhaustedError as exc:
                 observe_latency(
@@ -286,7 +339,10 @@ def create_router(
                 return JSONResponse(
                     all_providers_error_body(exc),
                     status_code=503,
-                    headers={"x-trace-id": trace_id},
+                    headers={
+                        "x-trace-id": trace_id,
+                        _CACHE_HEADER: _CACHE_MISS,
+                    },
                 )
             except Exception as exc:
                 observe_latency(
@@ -304,7 +360,25 @@ def create_router(
                 raise
 
             if cache_key is not None:
-                await cache.set(cache_key, [result.choices[0].message.content])
+                chunks = [result.choices[0].message.content]
+                await asyncio.gather(
+                    cache.set(cache_key, chunks),
+                    cache.set_semantic(
+                        cache_key,
+                        body,
+                        chunks,
+                        prompt=(
+                            semantic_lookup.prompt
+                            if semantic_lookup is not None
+                            else None
+                        ),
+                        embedding=(
+                            semantic_lookup.embedding
+                            if semantic_lookup is not None
+                            else None
+                        ),
+                    ),
+                )
 
             provider_name = provider_used(result)
             if provider_name is not None:
@@ -331,11 +405,12 @@ def create_router(
 
         # Streaming path — check cache before submitting to the batcher.
         cache_key = make_cache_key(body) if cache is not None else None
+        semantic_lookup = None
 
         if cache_key is not None:
             cached = await cache.get(cache_key)
-            record_cache_lookup(hit=cached is not None)
             if cached is not None:
+                record_cache_lookup(hit=True)
                 stream_id = f"chatcmpl-{uuid4().hex}"
                 created = int(time())
 
@@ -377,8 +452,73 @@ def create_router(
                 return StreamingResponse(
                     generate_cached(),
                     media_type="text/event-stream",
-                    headers={"x-trace-id": trace_id},
+                    headers={
+                        "x-trace-id": trace_id,
+                        _CACHE_HEADER: _CACHE_HIT_EXACT,
+                    },
                 )
+
+            semantic_lookup = await cache.lookup_semantic(body)
+            if semantic_lookup.hit:
+                record_cache_lookup(hit=True)
+                assert semantic_lookup.chunks is not None
+                await cache.set(cache_key, semantic_lookup.chunks)
+                await cache.set_semantic(
+                    cache_key,
+                    body,
+                    semantic_lookup.chunks,
+                    prompt=semantic_lookup.prompt,
+                    embedding=semantic_lookup.embedding,
+                )
+                stream_id = f"chatcmpl-{uuid4().hex}"
+                created = int(time())
+
+                async def generate_semantic_cached():
+                    for chunk_content in semantic_lookup.chunks or []:
+                        chunk = {
+                            "id": stream_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": body.model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": chunk_content},
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                    observe_latency(
+                        operation="http_chat_completion_stream",
+                        seconds=perf_counter() - started_at,
+                    )
+                    _schedule_usage_record(
+                        usage_tracker,
+                        api_key=api_key,
+                        model=body.model,
+                        prompt_tokens=prompt_tokens,
+                        completion_text="".join(semantic_lookup.chunks or []),
+                        completion_usage=None,
+                        log_fields={
+                            "trace_id": trace_id,
+                            "cache_hit": True,
+                            "cache_hit_type": "semantic",
+                            "stream": True,
+                        },
+                    )
+                    yield "data: [DONE]\n\n"
+
+                return StreamingResponse(
+                    generate_semantic_cached(),
+                    media_type="text/event-stream",
+                    headers={
+                        "x-trace-id": trace_id,
+                        _CACHE_HEADER: _CACHE_HIT_SEMANTIC,
+                    },
+                )
+
+            record_cache_lookup(hit=False)
 
         try:
             item = await streaming_batcher.submit(body, trace_id=trace_id)
@@ -399,6 +539,7 @@ def create_router(
             raise HTTPException(
                 status_code=503,
                 detail="Request queue is full",
+                headers={_CACHE_HEADER: _CACHE_MISS},
             ) from exc
         except Exception as exc:
             observe_latency(
@@ -488,7 +629,10 @@ def create_router(
             return JSONResponse(
                 all_providers_error_body(first_token),
                 status_code=503,
-                headers={"x-trace-id": trace_id},
+                headers={
+                    "x-trace-id": trace_id,
+                    _CACHE_HEADER: _CACHE_MISS,
+                },
             )
 
         if isinstance(first_token, RetryExhaustedError):
@@ -591,7 +735,24 @@ def create_router(
                     token = _NO_STREAM_ITEM
 
                 if cache_key is not None and collected:
-                    await cache.set(cache_key, collected)
+                    await asyncio.gather(
+                        cache.set(cache_key, collected),
+                        cache.set_semantic(
+                            cache_key,
+                            body,
+                            collected,
+                            prompt=(
+                                semantic_lookup.prompt
+                                if semantic_lookup is not None
+                                else None
+                            ),
+                            embedding=(
+                                semantic_lookup.embedding
+                                if semantic_lookup is not None
+                                else None
+                            ),
+                        ),
+                    )
 
                 observe_latency(
                     operation="http_chat_completion_stream",
@@ -620,6 +781,7 @@ def create_router(
             media_type="text/event-stream",
             headers={
                 **({"x-trace-id": trace_id}),
+                **({_CACHE_HEADER: _CACHE_MISS}),
                 **(
                     {_PROVIDER_USED_HEADER: provider_name}
                     if provider_name is not None

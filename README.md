@@ -60,9 +60,18 @@ During streaming, the response generator polls `request.is_disconnected()`. When
 
 `services/cache.py` caches completed responses in Redis, keyed by a SHA-256 hash of `(model, messages, temperature, max_tokens)`. Both the streaming and non-streaming paths check the cache before hitting the batcher. Cache hits replay stored chunks as SSE on the streaming path.
 
+The exact cache is checked first. On an exact miss, the gateway can also embed
+the user-facing prompt with `text-embedding-3-small` and query a Redis Stack
+HNSW vector index for recent near-duplicates. Semantic hits return the cached
+response without dispatching to the provider. Responses include `X-Cache` with
+`HIT-EXACT`, `HIT-SEMANTIC`, or `MISS`.
+
 ```bash
-# Run with caching enabled (requires Redis at localhost:6379)
+# Run with caching enabled (semantic caching requires Redis Stack + OPENAI_API_KEY)
 uv run python main.py
+
+# Disable semantic caching while keeping exact caching enabled
+SEMANTIC_CACHE_ENABLED=false uv run python main.py
 
 # Disable caching
 CACHE_ENABLED=false uv run python main.py

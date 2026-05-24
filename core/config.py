@@ -40,6 +40,11 @@ class Settings:
     redis_url: str = "redis://localhost:6379"
     cache_ttl_seconds: int = 3600
     cache_enabled: bool = True
+    semantic_cache_enabled: bool = True
+    semantic_cache_ttl_seconds: int = 3600
+    semantic_cache_threshold: float = 0.95
+    semantic_cache_embedding_model: str = "text-embedding-3-small"
+    semantic_cache_embedding_dimension: int = 1536
     allowed_api_keys: tuple[str, ...] = ()
     api_key_priorities: Mapping[str, PriorityLevel] = field(default_factory=dict)
     rate_limit_capacity: int = 60
@@ -196,6 +201,9 @@ def load_settings() -> Settings:
     provider_fallback_chain = tuple(
         provider.lower() for provider in _read_csv("PROVIDER_FALLBACK_CHAIN")
     )
+    semantic_cache_enabled = (
+        os.getenv("SEMANTIC_CACHE_ENABLED", "true").lower() != "false"
+    )
     provider = (
         provider_fallback_chain[0]
         if provider_fallback_chain
@@ -224,7 +232,7 @@ def load_settings() -> Settings:
         provider_fallback_chain=provider_fallback_chain,
         openai_api_key=(
             os.getenv("OPENAI_API_KEY")
-            if "openai" in configured_providers
+            if "openai" in configured_providers or semantic_cache_enabled
             else None
         ),
         anthropic_api_key=(

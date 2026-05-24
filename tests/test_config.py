@@ -27,6 +27,7 @@ def test_provider_env_selects_active_provider_and_key() -> None:
             "PROVIDER": "anthropic",
             "OPENAI_API_KEY": "ignored-openai-key",
             "ANTHROPIC_API_KEY": "anthropic-key",
+            "SEMANTIC_CACHE_ENABLED": "false",
         },
         clear=True,
     ):
@@ -92,6 +93,49 @@ def test_circuit_breaker_settings_are_loaded_from_environment() -> None:
     assert settings.cb_error_threshold == 0.75
     assert settings.cb_window_seconds == 45
     assert settings.cb_cooldown_seconds == 10
+
+
+def test_semantic_cache_settings_are_loaded_from_environment() -> None:
+    with patch.dict(
+        "os.environ",
+        {
+            "PROVIDER": "anthropic",
+            "OPENAI_API_KEY": "openai-key",
+            "ANTHROPIC_API_KEY": "anthropic-key",
+            "SEMANTIC_CACHE_ENABLED": "true",
+            "SEMANTIC_CACHE_TTL_SECONDS": "120",
+            "SEMANTIC_CACHE_THRESHOLD": "97",
+            "SEMANTIC_CACHE_EMBEDDING_MODEL": "text-embedding-3-small",
+            "SEMANTIC_CACHE_EMBEDDING_DIMENSION": "1536",
+        },
+        clear=True,
+    ):
+        settings = load_settings()
+
+    assert settings.provider == "anthropic"
+    assert settings.openai_api_key == "openai-key"
+    assert settings.semantic_cache_enabled is True
+    assert settings.semantic_cache_ttl_seconds == 120
+    assert settings.semantic_cache_threshold == 0.97
+    assert settings.semantic_cache_embedding_model == "text-embedding-3-small"
+    assert settings.semantic_cache_embedding_dimension == 1536
+
+
+def test_semantic_cache_can_be_disabled_independently() -> None:
+    with patch.dict(
+        "os.environ",
+        {
+            "PROVIDER": "echo",
+            "OPENAI_API_KEY": "ignored",
+            "SEMANTIC_CACHE_ENABLED": "false",
+        },
+        clear=True,
+    ):
+        settings = load_settings()
+
+    assert settings.cache_enabled is True
+    assert settings.semantic_cache_enabled is False
+    assert settings.openai_api_key is None
 
 
 def test_provider_fallback_chain_selects_primary_and_loads_chain_keys() -> None:
