@@ -199,6 +199,7 @@ All settings are read from environment variables with the defaults shown below.
 | `CB_ERROR_THRESHOLD` | `0.5` | Provider circuit opens at this error rate; values over `1` are treated as percentages |
 | `CB_WINDOW_SECONDS` | `60` | Sliding window used for provider error-rate counters |
 | `CB_COOLDOWN_SECONDS` | `30` | Time an open provider circuit stays blocked before one half-open probe |
+| `SHUTDOWN_DRAIN_TIMEOUT_SECONDS` | `30.0` | Seconds to wait for in-flight requests and active streams after `SIGTERM` before aborting remaining work |
 
 Example with custom settings:
 

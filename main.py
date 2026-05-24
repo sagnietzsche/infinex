@@ -3,6 +3,8 @@ from contextlib import asynccontextmanager
 import hmac
 import logging
 import os
+import signal
+from types import FrameType
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -23,6 +25,7 @@ from services.circuit_breaker import CircuitBreaker
 from services.provider_router import ProviderRoute, ProviderRouter
 from services.rate_limit import RedisTokenBucketRateLimiter
 from services.retry import RetryPolicy
+from services.shutdown import ShutdownDrain
 from services.usage import UsageTracker
 from services.virtual_keys import VirtualKeyMetadata, VirtualKeyStore
 
@@ -111,20 +114,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     virtual_key_store = VirtualKeyStore(redis_url=settings.redis_url)
     usage_tracker = UsageTracker(redis_url=settings.redis_url)
+    shutdown_drain = ShutdownDrain(
+        timeout_seconds=settings.shutdown_drain_timeout_seconds
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
+
+        def handle_sigterm(signum: int, frame: FrameType | None) -> None:
+            shutdown_drain.initiate()
+            if callable(previous_sigterm_handler):
+                previous_sigterm_handler(signum, frame)
+
+        try:
+            signal.signal(signal.SIGTERM, handle_sigterm)
+        except ValueError:
+            previous_sigterm_handler = None
+
         streaming_batcher.start()
-        yield
-        await batcher.close()
-        await streaming_batcher.close()
-        if cache is not None:
-            await cache.close()
-        if rate_limiter is not None:
-            await rate_limiter.close()
-        await virtual_key_store.close()
-        await circuit_breaker.close()
-        await usage_tracker.close()
+        try:
+            yield
+        finally:
+            if previous_sigterm_handler is not None:
+                signal.signal(signal.SIGTERM, previous_sigterm_handler)
+            if shutdown_drain.is_shutting_down:
+                await shutdown_drain.wait_until_complete()
+            await batcher.close()
+            await streaming_batcher.close()
+            if cache is not None:
+                await cache.close()
+            if rate_limiter is not None:
+                await rate_limiter.close()
+            await virtual_key_store.close()
+            await circuit_breaker.close()
+            await usage_tracker.close()
 
     app = FastAPI(title=settings.app_name, lifespan=lifespan)
     app.state.batcher = batcher
@@ -134,6 +158,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.virtual_key_store = virtual_key_store
     app.state.circuit_breaker = circuit_breaker
     app.state.usage_tracker = usage_tracker
+    app.state.shutdown_drain = shutdown_drain
 
     @app.middleware("http")
     async def api_key_rate_limit_middleware(
@@ -206,6 +231,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             request.state.api_key_priority = settings.priority_for_api_key(api_key)
         return await call_next(request)
 
+    @app.middleware("http")
+    async def shutdown_drain_middleware(request: Request, call_next):
+        if shutdown_drain.is_shutting_down:
+            return JSONResponse(
+                {"detail": "Gateway is shutting down"},
+                status_code=503,
+            )
+
+        async with shutdown_drain.track_request():
+            return await call_next(request)
+
     app.mount("/metrics", make_asgi_app())
     app.include_router(
         create_router(
@@ -214,6 +250,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             cache,
             circuit_breaker,
             usage_tracker,
+            shutdown_drain,
         )
     )
     app.include_router(
