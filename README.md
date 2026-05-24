@@ -1,134 +1,218 @@
-## llm-gateway
+# llm-gateway
 
-A middleware service between your application and an LLM provider.
+[![CI and Deploy](https://github.com/sagnikc395/llm-gateway/actions/workflows/ci-deploy.yml/badge.svg)](https://github.com/sagnikc395/llm-gateway/actions/workflows/ci-deploy.yml)
 
-When you have many clients sending requests to an LLM, the naive one-request-per-connection setup has several problems:
+`llm-gateway` is a FastAPI service that sits between your application and one or
+more LLM providers. It exposes an OpenAI-style chat completions endpoint and
+adds the operational pieces that are easy to forget when every service calls an
+LLM provider directly: request scheduling, backpressure, caching, API key
+control, rate limits, usage accounting, metrics, retries, failover, and an admin
+API for virtual keys.
 
-1. **Throughput is bad.** GPUs are optimized for batched inference. Sending requests one-by-one wastes GPU efficiency.
-2. **No control plane.** Every client holds the provider API key directly. There's no layer for per-user rate limiting, cost tracking, or access control.
-3. **No observability.** You can't see error rates, latency distributions, or aggregate usage across all requests.
-4. **No resilience.** If the provider goes down, your app dies. There's no place to inject retries, failover, or circuit breakers.
-5. **Identical requests get re-computed.** If 10 users ask the same question, the LLM processes it 10 times.
+The default provider is `echo`, so the project can run locally without a paid
+LLM API key. Real provider calls go through LiteLLM and currently support
+OpenAI, Anthropic, Gemini or Google, and Ollama.
 
-The gateway addresses all of these at the middleware layer.
+## What this is for
 
----
+Use this gateway when you want one controlled place for LLM traffic instead of
+giving every client direct access to provider credentials.
 
-### Features
+It is useful for:
 
-#### 1. Async Microbatcher
+- Hiding provider API keys from client apps.
+- Applying per-key rate limits and priority levels.
+- Smoothing traffic bursts with bounded queues.
+- Avoiding repeated work with exact and semantic response caching.
+- Tracking usage, token counts, and estimated cost per API key.
+- Watching request volume, latency, cache hits, queue depth, and failover events.
+- Retrying transient provider errors and falling back to another provider.
+- Managing virtual API keys from an operator-only admin API.
 
-`POST /v1/chat/completions` (non-streaming) queues requests and flushes them as a parallel batch when either `BATCH_MAX_SIZE` is reached or `BATCH_MAX_WAIT_MS` expires. Each caller receives its own response.
-The pending batch queue is bounded by `BATCH_QUEUE_MAX_SIZE`; when that queue is
-full the gateway returns `503` with `{"detail":"Request queue is full"}`.
-Requests can include `"priority": "low" | "normal" | "high"`; the default is
-`"normal"`. When there is a backlog, queued requests dispatch by priority first
-and enqueue age second, so older high-priority requests run before lower tiers.
+One important detail: the batchers collect requests over a short scheduling
+window and then dispatch provider calls concurrently. They do not currently send
+a single provider-native batch inference request. That still gives the gateway a
+central queue, priority ordering, backpressure, and useful batch metrics. A true
+provider batch implementation could be added behind the provider interface.
+
+## Quick start
+
+Requirements:
+
+- Python 3.13
+- `uv`
+- Redis for the default cache, readiness checks, circuit breaker state, usage
+  storage, and virtual keys
+
+Install dependencies:
 
 ```bash
-# Non-streaming completion
-curl -s http://127.0.0.1:8000/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{"messages":[{"role":"user","content":"hello gateway"}]}'
-
-# Inspect batching counters
-curl -s http://127.0.0.1:8000/stats
+uv sync --all-groups
 ```
 
-#### 2. Dynamic Streaming Batcher
-
-`POST /v1/chat/completions` with `"stream": true` runs through `DynamicBatcher`, which collects concurrent requests into a batch, fires all provider calls in parallel, and fans tokens back to each caller over Server-Sent Events. Client sees incremental output; provider calls are still batched.
-
-```bash
-curl -s http://127.0.0.1:8000/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{"messages":[{"role":"user","content":"stream this"}],"stream":true}'
-```
-
-#### 3. Request Queue
-
-`services/queue.py` provides a bounded queue with backpressure. Two backends:
-
-- **`InMemoryRequestQueue`** — heap-backed in-process queue, raises `QueueFullError` when at capacity.
-- **`KafkaRequestQueue`** — publishes requests to a Kafka topic, resolves futures when a matching response arrives on the reply topic. Suitable for distributed, multi-gateway deployments.
-
-#### 4. Client Disconnect Detection
-
-During streaming, the response generator polls `request.is_disconnected()`. When the client drops, `item.cancelled` is set and the provider stream is closed immediately via `aclosing()`, so no tokens are wasted generating a response nobody will read.
-
-#### 5. Redis Response Cache
-
-`services/cache.py` caches completed responses in Redis, keyed by a SHA-256 hash of `(model, messages, temperature, max_tokens)`. Both the streaming and non-streaming paths check the cache before hitting the batcher. Cache hits replay stored chunks as SSE on the streaming path.
-
-The exact cache is checked first. On an exact miss, the gateway can also embed
-the user-facing prompt with `text-embedding-3-small` and query a Redis Stack
-HNSW vector index for recent near-duplicates. Semantic hits return the cached
-response without dispatching to the provider. Responses include `X-Cache` with
-`HIT-EXACT`, `HIT-SEMANTIC`, or `MISS`.
+For the lightest local demo, disable the cache so a missing Redis instance does
+not break the first chat request:
 
 ```bash
-# Run with caching enabled (semantic caching requires Redis Stack + OPENAI_API_KEY)
-uv run python main.py
-
-# Disable semantic caching while keeping exact caching enabled
-SEMANTIC_CACHE_ENABLED=false uv run python main.py
-
-# Disable caching
 CACHE_ENABLED=false uv run python main.py
 ```
 
-#### 6. API Key Auth + Redis Rate Limiting
+The service starts at `http://0.0.0.0:8000` with reload enabled.
 
-When `API_KEYS` is configured, requests must include `X-API-Key` with one of the configured values. The same middleware applies a per-key Redis token bucket using a Lua script, so the read/update operation is atomic inside Redis. Limited requests return `429 Too Many Requests` with `Retry-After`.
+Try the default echo provider:
 
 ```bash
-API_KEYS=dev-key RATE_LIMIT_CAPACITY=60 RATE_LIMIT_REFILL_PER_SECOND=1 uv run python main.py
-
-# Premium keys are accepted as normal auth keys and automatically get high priority.
-API_KEYS='dev-key,premium-key:tier=premium' uv run python main.py
-
 curl -s http://127.0.0.1:8000/v1/chat/completions \
   -H 'content-type: application/json' \
-  -H 'x-api-key: dev-key' \
   -d '{"messages":[{"role":"user","content":"hello gateway"}]}'
 ```
 
-#### 7. Prometheus Metrics + Trace Logs
-
-Prometheus metrics are exposed at `/metrics`. The gateway tracks request volume,
-latency histograms, cache hit rate, current queue depth, queue depth per
-priority level, and batch fill metrics.
+For the full default setup, run Redis and leave caching enabled:
 
 ```bash
-curl -s http://127.0.0.1:8000/metrics
+redis-server
+uv run python main.py
 ```
 
-Structured JSON logs include `trace_id`, and batcher events include both
-`trace_id` and `batcher_id`. Clients can pass `X-Trace-Id`; otherwise the
-gateway generates one and returns it in the `X-Trace-Id` response header.
+If Redis is not reachable, `/health` can still return `ok`, but `/ready` will
+return `503` because readiness checks Redis and provider circuit state.
 
-#### 8. Provider Retries
+## API
 
-Provider responses with `429`, `500`, `502`, `503`, or `504` are retried
-automatically before the gateway returns a failure. Retries use full-jitter
-exponential backoff and are applied to streaming calls only until the first
-token is emitted. If retry attempts are exhausted, the provider error response
-includes `X-Retries-Attempted`.
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/health` | Liveness check with process uptime |
+| `GET` | `/ready` | Readiness check for Redis, queue capacity, provider circuits, and shutdown drain |
+| `GET` | `/metrics` | Prometheus metrics |
+| `GET` | `/stats` | Non-streaming batcher counters |
+| `POST` | `/v1/chat/completions` | Chat completion, streaming or non-streaming |
+| `POST` | `/admin/keys` | Create a virtual API key |
+| `DELETE` | `/admin/keys/{key}` | Revoke a virtual API key |
+| `GET` | `/admin/keys/{key}/usage` | Lifetime usage totals for a key |
+| `POST` | `/admin/cache/flush` | Clear cached responses, optionally with `?prefix=` |
+| `GET` | `/admin/providers` | Provider circuit state and recent error rate |
 
-#### 9. Provider Failover + Circuit Breakers
+## Chat requests
 
-`PROVIDER_FALLBACK_CHAIN` configures ordered provider failover. Each provider
-also has an independent Redis-backed circuit breaker. The breaker tracks
-success/error events in a sliding window and opens when the provider error rate
-reaches `CB_ERROR_THRESHOLD`; open providers are skipped until
-`CB_COOLDOWN_SECONDS` elapses, then one half-open probe is allowed.
+Non-streaming request:
 
-#### 10. Admin Control Plane
+```bash
+curl -s http://127.0.0.1:8000/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "gateway-echo",
+    "messages": [{"role": "user", "content": "explain the gateway"}]
+  }'
+```
 
-Set `ADMIN_API_KEY` to enable protected `/admin` routes for operators. Every
-admin request must include `X-Admin-Key`. Admin-created virtual API keys are
-stored in Redis by SHA-256 hash under `admin:key:{hashed_key}`; the raw key is
-returned only in the create response.
+Streaming request:
+
+```bash
+curl -s http://127.0.0.1:8000/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "messages": [{"role": "user", "content": "stream this back"}],
+    "stream": true
+  }'
+```
+
+Requests can include `priority` as `low`, `normal`, or `high`. When there is a
+backlog, higher priority requests are dispatched first. Requests with the same
+priority are ordered by enqueue time.
+
+```json
+{
+  "messages": [{"role": "user", "content": "run soon"}],
+  "priority": "high"
+}
+```
+
+Clients can also pass `X-Trace-Id`. If they do not, the gateway creates one and
+returns it in the `X-Trace-Id` response header.
+
+## Providers
+
+The provider is selected with `PROVIDER`. The default is `echo`.
+
+```bash
+PROVIDER=openai OPENAI_API_KEY=... uv run python main.py
+PROVIDER=anthropic ANTHROPIC_API_KEY=... uv run python main.py
+PROVIDER=gemini GOOGLE_API_KEY=... uv run python main.py
+PROVIDER=ollama OLLAMA_BASE_URL=http://localhost:11434 uv run python main.py
+```
+
+Provider failover is configured with `PROVIDER_FALLBACK_CHAIN`:
+
+```bash
+PROVIDER_FALLBACK_CHAIN=openai,anthropic \
+OPENAI_API_KEY=... \
+ANTHROPIC_API_KEY=... \
+uv run python main.py
+```
+
+Each provider in the chain gets its own Redis-backed circuit breaker. The router
+skips open circuits, allows one half-open probe after the cooldown, and records
+failover metrics. Model mapping for fallback providers currently lives in
+`core/config.py`.
+
+## Caching
+
+When `CACHE_ENABLED=true`, completed responses are stored in Redis. The exact
+cache key is built from:
+
+- `model`
+- `messages`
+- `temperature`
+- `max_tokens`
+
+Responses include an `X-Cache` header with one of:
+
+- `HIT-EXACT`
+- `HIT-SEMANTIC`
+- `MISS`
+
+Semantic caching is enabled by default when caching is enabled. It embeds the
+user-facing prompt, stores vectors in a Redis Stack HNSW index, and can reuse a
+recent near-duplicate response when the model and generation settings match.
+
+Semantic caching needs Redis Stack and an OpenAI-compatible embedding key for
+the default `text-embedding-3-small` model.
+
+```bash
+SEMANTIC_CACHE_ENABLED=false uv run python main.py
+CACHE_ENABLED=false uv run python main.py
+```
+
+## Auth, rate limits, and virtual keys
+
+Regular API key checks are enabled when either `API_KEYS` or `ADMIN_API_KEY` is
+set.
+
+Static keys come from `API_KEYS`:
+
+```bash
+API_KEYS=dev-key RATE_LIMIT_CAPACITY=60 RATE_LIMIT_REFILL_PER_SECOND=1 uv run python main.py
+```
+
+Then call the gateway with `X-API-Key`:
+
+```bash
+curl -s http://127.0.0.1:8000/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -H 'x-api-key: dev-key' \
+  -d '{"messages":[{"role":"user","content":"hello"}]}'
+```
+
+Static keys can include metadata for priority:
+
+```bash
+API_KEYS='dev-key,premium-key:tier=premium,slow-key:priority=low' uv run python main.py
+```
+
+`tier=premium` maps to high priority.
+
+Set `ADMIN_API_KEY` to use the admin routes. Admin-created virtual keys are
+stored in Redis by SHA-256 hash. The raw key is returned only when it is created.
 
 ```bash
 ADMIN_API_KEY=operator-secret uv run python main.py
@@ -137,124 +221,168 @@ curl -s http://127.0.0.1:8000/admin/keys \
   -H 'content-type: application/json' \
   -H 'x-admin-key: operator-secret' \
   -d '{"label":"prod app","tier":"premium","rate_limit_capacity":120}'
-
-curl -s http://127.0.0.1:8000/admin/providers \
-  -H 'x-admin-key: operator-secret'
 ```
 
----
+If only `ADMIN_API_KEY` is set, regular chat requests must use a valid virtual
+key created through the admin API.
 
-### Running the service
+## Observability
 
-```bash
-uv run python main.py
-```
+Prometheus metrics are exposed at `/metrics`. The gateway records:
 
-The service starts on `http://0.0.0.0:8000` with hot-reload enabled.
+- Accepted request count by endpoint and streaming mode.
+- Latency histograms for HTTP, queue, batcher, and provider work.
+- Cache hit rate.
+- Current queue depth and queue depth by priority.
+- Batch size and batch fill ratio.
+- Provider failover count.
 
-**Endpoints:**
+Application logs are structured JSON. Request logs include the trace ID where
+one is available, and batcher logs include both trace IDs and batch IDs.
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/health` | Liveness check with process uptime |
-| `GET` | `/ready` | Readiness check for Redis, queue depth, and provider circuits |
-| `GET` | `/metrics` | Prometheus metrics |
-| `GET` | `/stats` | Batcher counters |
-| `POST` | `/v1/chat/completions` | Chat completion (streaming or non-streaming) |
-| `POST` | `/admin/keys` | Create a virtual API key |
-| `DELETE` | `/admin/keys/{key}` | Revoke a virtual API key |
-| `GET` | `/admin/keys/{key}/usage` | Lifetime usage for a key |
-| `POST` | `/admin/cache/flush` | Clear cached responses, optionally with `?prefix=` |
-| `GET` | `/admin/providers` | Provider activity, circuit state, and recent error rate |
+Usage accounting runs in the background after a request completes. Prompt tokens
+are counted with `tiktoken` when possible, with a character-count fallback for
+unknown models. Completion usage is taken from the provider response when the
+provider returns it, otherwise the gateway counts completion text locally.
 
----
+## Reliability behavior
 
-### Configuration
+The gateway retries provider errors with status `429`, `500`, `502`, `503`, and
+`504`. Retries use full-jitter exponential backoff. Streaming calls are retried
+only until the first token has been emitted.
 
-All settings are read from environment variables with the defaults shown below.
+When all retries fail, the response includes `X-Retries-Attempted`.
+
+Provider failover happens for retry exhaustion, open circuits, and transient or
+server-side provider errors. If every provider in the fallback chain fails, the
+gateway returns `503` with the failure details.
+
+During shutdown, the app stops accepting new non-probe traffic and waits for
+in-flight requests and active streams up to `SHUTDOWN_DRAIN_TIMEOUT_SECONDS`.
+
+During streaming, the server checks whether the client disconnected. If the
+client drops, the stream is marked cancelled and the provider stream is closed
+so the gateway stops spending tokens on a response that no one will read.
+
+## Request queue module
+
+`services/queue.py` contains reusable queue implementations:
+
+- `InMemoryRequestQueue` for an in-process priority queue.
+- `KafkaRequestQueue`, `KafkaQueueConsumer`, and `KafkaResponseConsumer` for a
+  distributed request and response workflow.
+
+The current FastAPI app uses the batchers in `services/batcher.py` directly.
+The Kafka queue is available as a service module and is covered by tests, but it
+is not currently selected by an environment variable in `create_app`.
+
+## Configuration
+
+All settings are read from environment variables.
+Use [`.env.sample`](.env.sample) as the fill-in checklist for local shell
+variables, Railway service variables, and GitHub deployment secrets.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BATCH_MAX_SIZE` | `16` | Max requests per batch |
-| `BATCH_SIZE` | `16` | Alias for `BATCH_MAX_SIZE`; recommended tuning knob |
-| `BATCH_MAX_WAIT_MS` | `20` | Max time to wait before flushing a partial batch |
-| `MAX_WAIT_MS` | `20` | Alias for `BATCH_MAX_WAIT_MS`; recommended tuning knob |
-| `BATCH_QUEUE_MAX_SIZE` / `QUEUE_MAX_DEPTH` | `1024` | Max pending requests accepted before returning `503` |
-| `PROVIDER` | `echo` | LLM backend: `openai`, `anthropic`, `gemini`/`google`, `ollama`, or `echo` |
-| `PROVIDER_MODE` | `echo` | Backwards-compatible alias for `PROVIDER` |
-| `PROVIDER_FALLBACK_CHAIN` | empty | Ordered failover chain, e.g. `openai,anthropic`; first entry becomes the primary provider |
-| `OPENAI_API_KEY` | empty | Required when `PROVIDER=openai` |
-| `ANTHROPIC_API_KEY` | empty | Required when `PROVIDER=anthropic` |
-| `GOOGLE_API_KEY` / `GEMINI_API_KEY` | empty | Required when `PROVIDER=gemini` or `PROVIDER=google` |
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama base URL when `PROVIDER=ollama` |
-| `REDIS_URL` | `redis://localhost:6379` | Redis connection URL for cache, rate-limit, and circuit-breaker state |
-| `CACHE_TTL_SECONDS` | `3600` | Cache entry lifetime in seconds |
-| `CACHE_ENABLED` | `true` | Set to `false` to disable response caching |
-| `API_KEYS` | empty | Comma-separated allowed API keys. Empty disables auth/rate-limit middleware. Entries can include metadata, e.g. `premium-key:tier=premium` for automatic high priority or `slow-key:priority=low` |
-| `ADMIN_API_KEY` | empty | Required `X-Admin-Key` value for protected `/admin` routes and virtual-key management |
-| `RATE_LIMIT_CAPACITY` | `60` | Max burst size per API key |
-| `RATE_LIMIT_REFILL_PER_SECOND` | `1.0` | Tokens restored per second per API key |
-| `MAX_RETRIES` | `3` | Provider retry attempts after the first failed call |
-| `RETRY_BASE_DELAY_MS` | `200` | Base delay for provider retry backoff |
-| `RETRY_MAX_DELAY_MS` | `5000` | Maximum delay cap for provider retry backoff |
-| `CB_ERROR_THRESHOLD` | `0.5` | Provider circuit opens at this error rate; values over `1` are treated as percentages |
-| `CB_WINDOW_SECONDS` | `60` | Sliding window used for provider error-rate counters |
-| `CB_COOLDOWN_SECONDS` | `30` | Time an open provider circuit stays blocked before one half-open probe |
-| `SHUTDOWN_DRAIN_TIMEOUT_SECONDS` | `30.0` | Seconds to wait for in-flight requests and active streams after `SIGTERM` before aborting remaining work |
+| `APP_NAME` | `llm-gateway` | FastAPI app name |
+| `BATCH_MAX_SIZE` | `16` | Maximum requests collected per scheduling window |
+| `BATCH_SIZE` | `16` | Alias for `BATCH_MAX_SIZE` |
+| `BATCH_MAX_WAIT_MS` | `20` | Maximum wait before dispatching a partial batch |
+| `MAX_WAIT_MS` | `20` | Alias for `BATCH_MAX_WAIT_MS` |
+| `BATCH_QUEUE_MAX_SIZE` | `1024` | Maximum pending requests before `503` |
+| `QUEUE_MAX_DEPTH` | `1024` | Alias for `BATCH_QUEUE_MAX_SIZE` |
+| `PROVIDER` | `echo` | `echo`, `openai`, `anthropic`, `gemini`, `google`, or `ollama` |
+| `PROVIDER_MODE` | `echo` | Backward-compatible alias for `PROVIDER` |
+| `PROVIDER_FALLBACK_CHAIN` | empty | Ordered provider chain, such as `openai,anthropic` |
+| `OPENAI_API_KEY` | empty | Required for `PROVIDER=openai`; also used by default semantic embeddings |
+| `ANTHROPIC_API_KEY` | empty | Required for `PROVIDER=anthropic` |
+| `GOOGLE_API_KEY` | empty | Required for `PROVIDER=gemini` or `PROVIDER=google` |
+| `GEMINI_API_KEY` | empty | Alias for `GOOGLE_API_KEY` |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama base URL |
+| `REDIS_URL` | `redis://localhost:6379` | Redis connection string |
+| `CACHE_ENABLED` | `true` | Enables Redis response caching |
+| `CACHE_TTL_SECONDS` | `3600` | Exact cache TTL |
+| `SEMANTIC_CACHE_ENABLED` | `true` | Enables Redis Stack vector cache lookups |
+| `SEMANTIC_CACHE_TTL_SECONDS` | `3600` | Semantic cache TTL |
+| `SEMANTIC_CACHE_THRESHOLD` | `0.95` | Minimum semantic similarity. Values over `1` are treated as percentages |
+| `SEMANTIC_CACHE_EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model for semantic cache |
+| `SEMANTIC_CACHE_EMBEDDING_DIMENSION` | `1536` | Embedding dimension for Redis vector index |
+| `API_KEYS` | empty | Comma-separated static API keys, optionally with metadata |
+| `ADMIN_API_KEY` | empty | Required value for `X-Admin-Key` on `/admin` routes |
+| `RATE_LIMIT_CAPACITY` | `60` | Token bucket burst size per key |
+| `RATE_LIMIT_REFILL_PER_SECOND` | `1.0` | Token bucket refill rate per key |
+| `MAX_RETRIES` | `3` | Retry attempts after the initial provider call fails |
+| `RETRY_BASE_DELAY_MS` | `200` | Base retry backoff delay |
+| `RETRY_MAX_DELAY_MS` | `5000` | Retry backoff cap |
+| `CB_ERROR_THRESHOLD` | `0.5` | Circuit breaker error-rate threshold |
+| `CB_WINDOW_SECONDS` | `60` | Circuit breaker sliding window |
+| `CB_COOLDOWN_SECONDS` | `30` | Time before an open circuit allows a half-open probe |
+| `SHUTDOWN_DRAIN_TIMEOUT_SECONDS` | `30.0` | Grace period for in-flight work during shutdown |
+| `LOG_LEVEL` | `INFO` | Python logging level |
 
-Example with custom settings:
+## Load testing
 
-```bash
-BATCH_SIZE=16 MAX_WAIT_MS=20 CACHE_TTL_SECONDS=300 uv run python main.py
-```
-
-Example with Anthropic:
-
-```bash
-PROVIDER=anthropic ANTHROPIC_API_KEY=... uv run python main.py
-```
-
-Example with provider failover:
-
-```bash
-PROVIDER_FALLBACK_CHAIN=openai,anthropic \
-OPENAI_API_KEY=... ANTHROPIC_API_KEY=... \
-uv run python main.py
-```
-
-### Load testing
-
-Use `scripts/load/batching_sweet_spot.js` to validate 50+ concurrent users,
-generate p95/p99 reports, and force the queue-full backpressure path:
+The k6 script in `scripts/load/batching_sweet_spot.js` exercises concurrent
+traffic, reports p95 and p99 latency, and can force the queue-full `503` path.
 
 ```bash
 CACHE_ENABLED=false BATCH_SIZE=16 MAX_WAIT_MS=20 uv run python main.py
 k6 run -e VUS=60 -e DURATION=2m scripts/load/batching_sweet_spot.js
 ```
 
-Reports are written to `reports/k6-batching-summary.json` and
-`reports/k6-batching-summary.md`. See `docs/load-testing.md` for the full
-batching sweep and `503` backpressure run.
+Reports are written to:
 
-### CI/CD and deployment
+- `reports/k6-batching-summary.json`
+- `reports/k6-batching-summary.md`
 
-Pull requests run `pytest`, `ruff`, and `mypy` through GitHub Actions. Pushes to
-`main` run the same quality gate and then deploy to Railway using the production
-Docker image.
+See `docs/load-testing.md` for the full sweep and backpressure run.
 
-Required GitHub configuration:
+## Tests and quality checks
 
 ```bash
-# Repository or production environment secret
-RAILWAY_TOKEN=...
+uv run ruff check .
+uv run mypy
+uv run pytest
+```
 
-# Optional repository or production environment variables
+GitHub Actions runs the same checks on pull requests and pushes to `main`.
+Pushes to `main` also deploy to Railway through
+[`.github/workflows/ci-deploy.yml`](.github/workflows/ci-deploy.yml) when the
+Railway configuration is present.
+
+## Deployment
+
+Useful deployment links:
+
+- [CI and deployment workflow](.github/workflows/ci-deploy.yml)
+- [GitHub Actions run history](https://github.com/sagnikc395/llm-gateway/actions/workflows/ci-deploy.yml)
+- [Railway deployment config](railway.json)
+- [Production Dockerfile](Dockerfile)
+- [Environment variable sample](.env.sample)
+
+The [Dockerfile](Dockerfile) builds a Python 3.13 runtime image and starts:
+
+```bash
+uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
+```
+
+[`railway.json`](railway.json) uses the Dockerfile builder and `/health` as the
+deployment health check.
+
+Required GitHub secret for Railway deploys:
+
+```bash
+RAILWAY_TOKEN=...
+```
+
+Optional GitHub variables:
+
+```bash
 RAILWAY_SERVICE=llm-gateway
 RAILWAY_ENVIRONMENT=production
 ```
 
-Runtime secrets stay in Railway service or shared variables, not in the
-repository:
+Runtime secrets should live in Railway variables, not in the repository:
 
 ```bash
 railway variable set "REDIS_URL=redis://..." --service llm-gateway
@@ -263,30 +391,18 @@ railway variable set "API_KEYS=..." --service llm-gateway
 railway variable set "ADMIN_API_KEY=..." --service llm-gateway
 ```
 
-`railway.json` uses `/health` as the deployment health check so Railway waits
-for a healthy replacement deployment before routing traffic to it.
+## Project layout
 
----
-
-### Project Structure
-
-```
-.
-├── api/
-│   ├── health.py        # Kubernetes liveness/readiness probes
-│   └── routes.py        # FastAPI router: chat completions, stats
-├── core/
-│   ├── config.py        # Settings dataclass, env-var loading
-│   └── models.py        # Pydantic request/response models
-├── infra/
-│   └── providers/       # BaseProvider + LiteLLM-backed OpenAI/Anthropic/Gemini/Ollama providers
-├── services/
-│   ├── batcher.py       # AsyncRequestBatcher (non-streaming) + DynamicBatcher (streaming)
-│   ├── cache.py         # ResponseCache backed by Redis
-│   ├── circuit_breaker.py # Redis-backed provider circuit breaker
-│   ├── rate_limit.py    # Redis Lua token-bucket rate limiter
-│   └── queue.py         # InMemoryRequestQueue + KafkaRequestQueue
-├── tests/               # pytest test suite
-├── main.py              # App factory + entry point
-└── pyproject.toml
+```text
+api/                 FastAPI routes for chat, admin, and health checks
+core/                Settings, request models, priorities, and pricing data
+infra/providers/     Echo provider and LiteLLM-backed provider adapters
+services/            Batching, caching, retries, rate limits, usage, queues, and shutdown
+docs/                Supporting project docs
+scripts/load/        k6 load-testing scripts
+tests/               pytest suite
+main.py              App factory and local entry point
+Dockerfile           Production container image
+railway.json         Railway deployment settings
+pyproject.toml       Python dependencies and tool config
 ```
