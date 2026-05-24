@@ -244,7 +244,9 @@ def load_settings() -> Settings:
             aliases=("MAX_WAIT_MS",),
         ),
         batch_queue_max_size=_read_positive_int(
-            "BATCH_QUEUE_MAX_SIZE", Settings.batch_queue_max_size
+            "BATCH_QUEUE_MAX_SIZE",
+            Settings.batch_queue_max_size,
+            aliases=("QUEUE_MAX_DEPTH",),
         ),
         provider=provider,
         provider_fallback_chain=provider_fallback_chain,

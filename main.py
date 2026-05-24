@@ -4,6 +4,7 @@ import hmac
 import logging
 import os
 import signal
+import time
 from types import FrameType
 
 import uvicorn
@@ -12,6 +13,7 @@ from fastapi.responses import JSONResponse
 from prometheus_client import make_asgi_app
 
 from api.admin import create_admin_router
+from api.health import RedisReadinessProbe, create_health_router
 from api.routes import create_router
 from core.config import Settings, load_settings
 from core.priority import normalize_priority
@@ -30,6 +32,28 @@ from services.usage import UsageTracker
 from services.virtual_keys import VirtualKeyMetadata, VirtualKeyStore
 
 
+_PROBE_PATHS = {"/health", "/ready"}
+
+
+class _ProbeAccessLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3:
+            path = str(args[2]).split("?", 1)[0]
+            return path not in _PROBE_PATHS
+        return True
+
+
+def _install_probe_access_log_filter() -> None:
+    access_logger = logging.getLogger("uvicorn.access")
+    if any(
+        isinstance(existing_filter, _ProbeAccessLogFilter)
+        for existing_filter in access_logger.filters
+    ):
+        return
+    access_logger.addFilter(_ProbeAccessLogFilter())
+
+
 def _priority_for_virtual_key(metadata: VirtualKeyMetadata):
     if metadata.priority is not None:
         return normalize_priority(metadata.priority)
@@ -43,6 +67,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         level=os.getenv("LOG_LEVEL", "INFO"),
         format="%(message)s",
     )
+    _install_probe_access_log_filter()
     settings = settings or load_settings()
     retry_policy = RetryPolicy(
         max_retries=settings.max_retries,
@@ -114,12 +139,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     virtual_key_store = VirtualKeyStore(redis_url=settings.redis_url)
     usage_tracker = UsageTracker(redis_url=settings.redis_url)
+    redis_readiness_probe = RedisReadinessProbe(redis_url=settings.redis_url)
     shutdown_drain = ShutdownDrain(
         timeout_seconds=settings.shutdown_drain_timeout_seconds
     )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        app.state.started_at_monotonic = time.monotonic()
         previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
 
         def handle_sigterm(signum: int, frame: FrameType | None) -> None:
@@ -147,6 +174,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if rate_limiter is not None:
                 await rate_limiter.close()
             await virtual_key_store.close()
+            await redis_readiness_probe.close()
             await circuit_breaker.close()
             await usage_tracker.close()
 
@@ -158,14 +186,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.virtual_key_store = virtual_key_store
     app.state.circuit_breaker = circuit_breaker
     app.state.usage_tracker = usage_tracker
+    app.state.redis_readiness_probe = redis_readiness_probe
     app.state.shutdown_drain = shutdown_drain
+    app.include_router(
+        create_health_router(
+            redis_probe=redis_readiness_probe,
+            batcher=batcher,
+            streaming_batcher=streaming_batcher,
+            circuit_breaker=circuit_breaker,
+            shutdown_drain=shutdown_drain,
+        )
+    )
 
     @app.middleware("http")
     async def api_key_rate_limit_middleware(
         request: Request, call_next
     ):
         if (
-            request.url.path == "/health"
+            request.url.path in _PROBE_PATHS
             or request.url.path.startswith("/admin")
             or request.url.path.startswith("/metrics")
             or not auth_enabled
@@ -233,6 +271,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.middleware("http")
     async def shutdown_drain_middleware(request: Request, call_next):
+        if request.url.path in _PROBE_PATHS:
+            return await call_next(request)
+
         if shutdown_drain.is_shutting_down:
             return JSONResponse(
                 {"detail": "Gateway is shutting down"},
