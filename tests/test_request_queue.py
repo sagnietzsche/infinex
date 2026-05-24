@@ -88,6 +88,16 @@ class InMemoryRequestQueueTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(QueueFullError):
             await queue.enqueue({"second": True})
 
+    async def test_get_returns_high_priority_before_older_low_priority(self) -> None:
+        queue = InMemoryRequestQueue(maxsize=3)
+        low = await queue.enqueue({"name": "low", "priority": "low"})
+        normal = await queue.enqueue({"name": "normal"})
+        high = await queue.enqueue({"name": "high", "priority": "high"})
+
+        self.assertEqual((await queue.get()).request_id, high.request_id)
+        self.assertEqual((await queue.get()).request_id, normal.request_id)
+        self.assertEqual((await queue.get()).request_id, low.request_id)
+
     async def test_consumer_resolves_future_with_executor_response(self) -> None:
         queue = InMemoryRequestQueue(maxsize=1)
         consumer = InMemoryQueueConsumer(queue, StaticExecutor())

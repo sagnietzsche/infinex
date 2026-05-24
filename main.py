@@ -141,6 +141,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 headers={"Retry-After": str(result.retry_after_seconds)},
             )
 
+        request.state.api_key_priority = settings.priority_for_api_key(api_key)
         return await call_next(request)
 
     app.mount("/metrics", make_asgi_app())

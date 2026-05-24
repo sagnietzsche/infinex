@@ -35,6 +35,9 @@ def request_with_prompt(prompt: str) -> ChatCompletionRequest:
 
 
 class AsyncRequestBatcherTests(unittest.IsolatedAsyncioTestCase):
+    async def test_request_priority_defaults_to_normal(self) -> None:
+        self.assertEqual(request_with_prompt("default").priority, "normal")
+
     async def test_flushes_when_max_batch_size_is_reached(self) -> None:
         provider = RecordingProvider()
         batcher = AsyncRequestBatcher(
@@ -97,4 +100,38 @@ class AsyncRequestBatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             (await first).choices[0].message.content,
             "done: one",
+        )
+
+    async def test_dispatches_high_priority_before_lower_priority_backlog(self) -> None:
+        provider = RecordingProvider()
+        batcher = AsyncRequestBatcher(
+            provider=provider,
+            max_batch_size=3,
+            max_wait_ms=1000,
+        )
+
+        low = asyncio.create_task(
+            batcher.submit(
+                ChatCompletionRequest(
+                    messages=[ChatMessage(role="user", content="low")],
+                    priority="low",
+                )
+            )
+        )
+        await asyncio.sleep(0)
+        high = asyncio.create_task(
+            batcher.submit(
+                ChatCompletionRequest(
+                    messages=[ChatMessage(role="user", content="high")],
+                    priority="high",
+                )
+            )
+        )
+        normal = asyncio.create_task(batcher.submit(request_with_prompt("normal")))
+
+        await asyncio.gather(low, high, normal)
+
+        self.assertEqual(
+            [request.messages[0].content for request in provider.requests],
+            ["high", "normal", "low"],
         )
