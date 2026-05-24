@@ -235,6 +235,36 @@ Reports are written to `reports/k6-batching-summary.json` and
 `reports/k6-batching-summary.md`. See `docs/load-testing.md` for the full
 batching sweep and `503` backpressure run.
 
+### CI/CD and deployment
+
+Pull requests run `pytest`, `ruff`, and `mypy` through GitHub Actions. Pushes to
+`main` run the same quality gate and then deploy to Railway using the production
+Docker image.
+
+Required GitHub configuration:
+
+```bash
+# Repository or production environment secret
+RAILWAY_TOKEN=...
+
+# Optional repository or production environment variables
+RAILWAY_SERVICE=llm-gateway
+RAILWAY_ENVIRONMENT=production
+```
+
+Runtime secrets stay in Railway service or shared variables, not in the
+repository:
+
+```bash
+railway variable set "REDIS_URL=redis://..." --service llm-gateway
+railway variable set "OPENAI_API_KEY=..." --service llm-gateway
+railway variable set "API_KEYS=..." --service llm-gateway
+railway variable set "ADMIN_API_KEY=..." --service llm-gateway
+```
+
+`railway.json` uses `/health` as the deployment health check so Railway waits
+for a healthy replacement deployment before routing traffic to it.
+
 ---
 
 ### Project Structure
