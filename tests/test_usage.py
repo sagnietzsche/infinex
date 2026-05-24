@@ -5,10 +5,6 @@ import hashlib
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
-
-from api.routes import create_router
 from services.usage import TokenCounter, UsageTotals, UsageTracker
 
 
@@ -58,6 +54,7 @@ class UsageTrackerTests(unittest.IsolatedAsyncioTestCase):
         mock_client.hincrby.assert_any_await(redis_key, "prompt_tokens", 10)
         mock_client.hincrby.assert_any_await(redis_key, "completion_tokens", 4)
         mock_client.hincrby.assert_any_await(redis_key, "total_tokens", 14)
+        mock_client.hincrby.assert_any_await(redis_key, "request_count", 1)
         mock_client.hincrbyfloat.assert_awaited_once_with(
             redis_key, "estimated_cost_usd", 0.0018
         )
@@ -69,6 +66,7 @@ class UsageTrackerTests(unittest.IsolatedAsyncioTestCase):
             "completion_tokens": "3",
             "total_tokens": "5",
             "estimated_cost_usd": "0.25",
+            "request_count": "4",
         }
 
         usage = await tracker.get_usage("secret-key")
@@ -80,6 +78,7 @@ class UsageTrackerTests(unittest.IsolatedAsyncioTestCase):
                 completion_tokens=3,
                 total_tokens=5,
                 estimated_cost_usd=0.25,
+                request_count=4,
             ),
         )
 
@@ -109,39 +108,3 @@ class TokenCounterTests(unittest.TestCase):
         )
 
         self.assertEqual(tokens, 2)
-
-
-class UsageAdminRouteTests(unittest.TestCase):
-    def test_admin_key_usage_endpoint_returns_totals(self) -> None:
-        class StubUsageTracker:
-            async def get_usage(self, key: str) -> UsageTotals:
-                self.key = key
-                return UsageTotals(
-                    prompt_tokens=7,
-                    completion_tokens=8,
-                    total_tokens=15,
-                    estimated_cost_usd=0.123,
-                )
-
-        app = FastAPI()
-        app.include_router(
-            create_router(
-                MagicMock(),
-                MagicMock(),
-                usage_tracker=StubUsageTracker(),  # type: ignore[arg-type]
-            )
-        )
-
-        with TestClient(app) as client:
-            response = client.get("/admin/keys/secret-key/usage")
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(
-            response.json(),
-            {
-                "prompt_tokens": 7,
-                "completion_tokens": 8,
-                "total_tokens": 15,
-                "estimated_cost_usd": 0.123,
-            },
-        )

@@ -47,6 +47,7 @@ class Settings:
     semantic_cache_embedding_dimension: int = 1536
     allowed_api_keys: tuple[str, ...] = ()
     api_key_priorities: Mapping[str, PriorityLevel] = field(default_factory=dict)
+    admin_api_key: str | None = None
     rate_limit_capacity: int = 60
     rate_limit_refill_per_second: float = 1.0
     max_retries: int = 3
@@ -251,8 +252,26 @@ def load_settings() -> Settings:
             "CACHE_TTL_SECONDS", Settings.cache_ttl_seconds
         ),
         cache_enabled=os.getenv("CACHE_ENABLED", "true").lower() != "false",
+        semantic_cache_enabled=semantic_cache_enabled,
+        semantic_cache_ttl_seconds=_read_positive_int(
+            "SEMANTIC_CACHE_TTL_SECONDS",
+            Settings.semantic_cache_ttl_seconds,
+        ),
+        semantic_cache_threshold=_read_threshold(
+            "SEMANTIC_CACHE_THRESHOLD",
+            Settings.semantic_cache_threshold,
+        ),
+        semantic_cache_embedding_model=os.getenv(
+            "SEMANTIC_CACHE_EMBEDDING_MODEL",
+            Settings.semantic_cache_embedding_model,
+        ),
+        semantic_cache_embedding_dimension=_read_positive_int(
+            "SEMANTIC_CACHE_EMBEDDING_DIMENSION",
+            Settings.semantic_cache_embedding_dimension,
+        ),
         allowed_api_keys=allowed_api_keys,
         api_key_priorities=api_key_priorities,
+        admin_api_key=os.getenv("ADMIN_API_KEY"),
         rate_limit_capacity=_read_positive_int(
             "RATE_LIMIT_CAPACITY", Settings.rate_limit_capacity
         ),

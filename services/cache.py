@@ -140,6 +140,20 @@ class ResponseCache:
     async def set(self, key: str, chunks: list[str]) -> None:
         await self._client.set(key, json.dumps(chunks), ex=self._ttl)
 
+    async def flush(self, *, prefix: str | None = None) -> int:
+        patterns = _cache_flush_patterns(prefix)
+        deleted = 0
+        for pattern in patterns:
+            batch: list[str] = []
+            async for key in self._client.scan_iter(match=pattern, count=500):
+                batch.append(str(key))
+                if len(batch) >= 500:
+                    deleted += await self._delete_batch(batch)
+                    batch = []
+            if batch:
+                deleted += await self._delete_batch(batch)
+        return deleted
+
     async def lookup_semantic(
         self, request: ChatCompletionRequest
     ) -> SemanticCacheLookup:
@@ -269,6 +283,11 @@ class ResponseCache:
         if self._semantic_client is not None:
             await self._semantic_client.aclose()
 
+    async def _delete_batch(self, keys: list[str]) -> int:
+        if not keys:
+            return 0
+        return int(await self._client.delete(*keys))
+
     async def _embed(self, prompt: str) -> list[float] | None:
         try:
             embedding = await self._embedding_provider.embed(prompt)
@@ -350,6 +369,17 @@ def _semantic_cache_key(*, key: str, prompt: str, signature: str) -> str:
         json.dumps(payload, sort_keys=True).encode()
     ).hexdigest()
     return _SEMANTIC_KEY_PREFIX + digest
+
+
+def _cache_flush_patterns(prefix: str | None) -> list[str]:
+    if not prefix:
+        return [f"{_KEY_PREFIX}*", f"{_SEMANTIC_KEY_PREFIX}*"]
+    if not (
+        prefix.startswith(_KEY_PREFIX)
+        or prefix.startswith(_SEMANTIC_KEY_PREFIX)
+    ):
+        raise ValueError("cache flush prefix must target response cache keys")
+    return [f"{prefix}*"]
 
 
 def _vector_blob(values: Sequence[float]) -> bytes:
