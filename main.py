@@ -9,8 +9,10 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from prometheus_client import make_asgi_app
 
+from api.admin import create_admin_router
 from api.routes import create_router
 from core.config import Settings, load_settings
+from core.priority import normalize_priority
 from infra.providers import (
     build_provider_for_name,
     build_streaming_provider_for_name,
@@ -22,6 +24,15 @@ from services.provider_router import ProviderRoute, ProviderRouter
 from services.rate_limit import RedisTokenBucketRateLimiter
 from services.retry import RetryPolicy
 from services.usage import UsageTracker
+from services.virtual_keys import VirtualKeyMetadata, VirtualKeyStore
+
+
+def _priority_for_virtual_key(metadata: VirtualKeyMetadata):
+    if metadata.priority is not None:
+        return normalize_priority(metadata.priority)
+    if (metadata.tier or "").lower() == "premium":
+        return "high"
+    return None
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -88,15 +99,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if settings.cache_enabled
         else None
     )
+    auth_enabled = bool(settings.allowed_api_keys or settings.admin_api_key)
     rate_limiter = (
         RedisTokenBucketRateLimiter(
             redis_url=settings.redis_url,
             capacity=settings.rate_limit_capacity,
             refill_rate_per_second=settings.rate_limit_refill_per_second,
         )
-        if settings.allowed_api_keys
+        if auth_enabled
         else None
     )
+    virtual_key_store = VirtualKeyStore(redis_url=settings.redis_url)
     usage_tracker = UsageTracker(redis_url=settings.redis_url)
 
     @asynccontextmanager
@@ -109,6 +122,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await cache.close()
         if rate_limiter is not None:
             await rate_limiter.close()
+        await virtual_key_store.close()
         await circuit_breaker.close()
         await usage_tracker.close()
 
@@ -117,6 +131,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.streaming_batcher = streaming_batcher
     app.state.cache = cache
     app.state.rate_limiter = rate_limiter
+    app.state.virtual_key_store = virtual_key_store
     app.state.circuit_breaker = circuit_breaker
     app.state.usage_tracker = usage_tracker
 
@@ -126,22 +141,56 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ):
         if (
             request.url.path == "/health"
+            or request.url.path.startswith("/admin")
             or request.url.path.startswith("/metrics")
-            or rate_limiter is None
+            or not auth_enabled
         ):
             return await call_next(request)
 
         api_key = request.headers.get("x-api-key")
-        if api_key is None or not any(
-            hmac.compare_digest(api_key, allowed_key)
-            for allowed_key in settings.allowed_api_keys
-        ):
+        if api_key is None:
             return JSONResponse(
                 {"detail": "Invalid or missing API key"},
                 status_code=401,
             )
 
-        result = await rate_limiter.check(api_key)
+        virtual_metadata: VirtualKeyMetadata | None = None
+        static_key_allowed = any(
+            hmac.compare_digest(api_key, allowed_key)
+            for allowed_key in settings.allowed_api_keys
+        )
+        if not static_key_allowed:
+            virtual_key = (
+                await virtual_key_store.get(api_key)
+                if settings.admin_api_key
+                else None
+            )
+            if virtual_key is None:
+                return JSONResponse(
+                    {"detail": "Invalid or missing API key"},
+                    status_code=401,
+                )
+            if virtual_key.revoked:
+                return JSONResponse(
+                    {"detail": "API key has been revoked"},
+                    status_code=403,
+                )
+            virtual_metadata = virtual_key.metadata
+
+        assert rate_limiter is not None
+        result = await rate_limiter.check(
+            api_key,
+            capacity=(
+                virtual_metadata.rate_limit_capacity
+                if virtual_metadata is not None
+                else None
+            ),
+            refill_rate_per_second=(
+                virtual_metadata.rate_limit_refill_per_second
+                if virtual_metadata is not None
+                else None
+            ),
+        )
         if not result.allowed:
             return JSONResponse(
                 {"detail": "Too Many Requests"},
@@ -149,7 +198,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 headers={"Retry-After": str(result.retry_after_seconds)},
             )
 
-        request.state.api_key_priority = settings.priority_for_api_key(api_key)
+        if virtual_metadata is not None:
+            request.state.api_key_priority = _priority_for_virtual_key(
+                virtual_metadata
+            )
+        else:
+            request.state.api_key_priority = settings.priority_for_api_key(api_key)
         return await call_next(request)
 
     app.mount("/metrics", make_asgi_app())
@@ -160,6 +214,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             cache,
             circuit_breaker,
             usage_tracker,
+        )
+    )
+    app.include_router(
+        create_admin_router(
+            admin_api_key=settings.admin_api_key,
+            virtual_key_store=virtual_key_store,
+            cache=cache,
+            circuit_breaker=circuit_breaker,
+            usage_tracker=usage_tracker,
         )
     )
 

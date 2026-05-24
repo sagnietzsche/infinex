@@ -111,6 +111,60 @@ class ResponseCacheTests(unittest.IsolatedAsyncioTestCase):
         await cache.close()
         mock_client.aclose.assert_called_once()
 
+    async def test_flush_deletes_exact_and_semantic_cache_keys(self) -> None:
+        cache, mock_client = self._make_cache()
+        mock_client.delete = AsyncMock(side_effect=[2, 1])
+        calls: list[tuple[str | None, int | None]] = []
+
+        async def scan_iter(match: str | None = None, count: int | None = None):
+            calls.append((match, count))
+            if match == "llm-gateway:v1:*":
+                yield "llm-gateway:v1:a"
+                yield "llm-gateway:v1:b"
+            if match == "llm-gateway:semantic:v1:*":
+                yield "llm-gateway:semantic:v1:a"
+
+        mock_client.scan_iter = scan_iter
+
+        deleted = await cache.flush()
+
+        self.assertEqual(deleted, 3)
+        self.assertEqual(
+            calls,
+            [
+                ("llm-gateway:v1:*", 500),
+                ("llm-gateway:semantic:v1:*", 500),
+            ],
+        )
+        mock_client.delete.assert_any_await(
+            "llm-gateway:v1:a",
+            "llm-gateway:v1:b",
+        )
+        mock_client.delete.assert_any_await("llm-gateway:semantic:v1:a")
+
+    async def test_flush_with_prefix_deletes_only_matching_keys(self) -> None:
+        cache, mock_client = self._make_cache()
+        mock_client.delete = AsyncMock(return_value=1)
+        calls: list[tuple[str | None, int | None]] = []
+
+        async def scan_iter(match: str | None = None, count: int | None = None):
+            calls.append((match, count))
+            yield "llm-gateway:v1:custom:a"
+
+        mock_client.scan_iter = scan_iter
+
+        deleted = await cache.flush(prefix="llm-gateway:v1:custom:")
+
+        self.assertEqual(deleted, 1)
+        self.assertEqual(calls, [("llm-gateway:v1:custom:*", 500)])
+        mock_client.delete.assert_awaited_once_with("llm-gateway:v1:custom:a")
+
+    async def test_flush_rejects_non_cache_prefix(self) -> None:
+        cache, _ = self._make_cache()
+
+        with self.assertRaises(ValueError):
+            await cache.flush(prefix="admin:key:")
+
     def _make_semantic_cache(self) -> tuple[ResponseCache, MagicMock, MagicMock]:
         exact_client = MagicMock()
         exact_client.get = AsyncMock(return_value=None)

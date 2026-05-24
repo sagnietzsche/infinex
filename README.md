@@ -123,6 +123,25 @@ success/error events in a sliding window and opens when the provider error rate
 reaches `CB_ERROR_THRESHOLD`; open providers are skipped until
 `CB_COOLDOWN_SECONDS` elapses, then one half-open probe is allowed.
 
+#### 10. Admin Control Plane
+
+Set `ADMIN_API_KEY` to enable protected `/admin` routes for operators. Every
+admin request must include `X-Admin-Key`. Admin-created virtual API keys are
+stored in Redis by SHA-256 hash under `admin:key:{hashed_key}`; the raw key is
+returned only in the create response.
+
+```bash
+ADMIN_API_KEY=operator-secret uv run python main.py
+
+curl -s http://127.0.0.1:8000/admin/keys \
+  -H 'content-type: application/json' \
+  -H 'x-admin-key: operator-secret' \
+  -d '{"label":"prod app","tier":"premium","rate_limit_capacity":120}'
+
+curl -s http://127.0.0.1:8000/admin/providers \
+  -H 'x-admin-key: operator-secret'
+```
+
 ---
 
 ### Running the service
@@ -141,6 +160,11 @@ The service starts on `http://0.0.0.0:8000` with hot-reload enabled.
 | `GET` | `/metrics` | Prometheus metrics |
 | `GET` | `/stats` | Batcher counters |
 | `POST` | `/v1/chat/completions` | Chat completion (streaming or non-streaming) |
+| `POST` | `/admin/keys` | Create a virtual API key |
+| `DELETE` | `/admin/keys/{key}` | Revoke a virtual API key |
+| `GET` | `/admin/keys/{key}/usage` | Lifetime usage for a key |
+| `POST` | `/admin/cache/flush` | Clear cached responses, optionally with `?prefix=` |
+| `GET` | `/admin/providers` | Provider activity, circuit state, and recent error rate |
 
 ---
 
@@ -166,6 +190,7 @@ All settings are read from environment variables with the defaults shown below.
 | `CACHE_TTL_SECONDS` | `3600` | Cache entry lifetime in seconds |
 | `CACHE_ENABLED` | `true` | Set to `false` to disable response caching |
 | `API_KEYS` | empty | Comma-separated allowed API keys. Empty disables auth/rate-limit middleware. Entries can include metadata, e.g. `premium-key:tier=premium` for automatic high priority or `slow-key:priority=low` |
+| `ADMIN_API_KEY` | empty | Required `X-Admin-Key` value for protected `/admin` routes and virtual-key management |
 | `RATE_LIMIT_CAPACITY` | `60` | Max burst size per API key |
 | `RATE_LIMIT_REFILL_PER_SECOND` | `1.0` | Tokens restored per second per API key |
 | `MAX_RETRIES` | `3` | Provider retry attempts after the first failed call |

@@ -81,15 +81,31 @@ class RedisTokenBucketRateLimiter:
         )
         self._key_prefix = key_prefix
 
-    async def check(self, api_key: str) -> RateLimitResult:
+    async def check(
+        self,
+        api_key: str,
+        *,
+        capacity: int | None = None,
+        refill_rate_per_second: float | None = None,
+    ) -> RateLimitResult:
+        capacity = capacity or self._capacity
+        refill_per_ms = (
+            self._refill_per_ms
+            if refill_rate_per_second is None
+            else refill_rate_per_second / 1000
+        )
+        ttl_ms = max(
+            1000,
+            math.ceil((capacity / (refill_per_ms * 1000)) * 2000),
+        )
         allowed, retry_after_ms = await self._client.eval(
             TOKEN_BUCKET_LUA,
             1,
             self._redis_key(api_key),
-            self._capacity,
-            self._refill_per_ms,
+            capacity,
+            refill_per_ms,
             1,
-            self._ttl_ms,
+            ttl_ms,
         )
         is_allowed = bool(int(allowed))
         return RateLimitResult(

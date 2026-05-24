@@ -33,7 +33,7 @@ from services.provider_router import (
 )
 from services.queue import QueueFullError
 from services.retry import RetryExhaustedError, provider_status_code
-from services.usage import UsageTotals, UsageTracker
+from services.usage import UsageTracker
 
 
 logger = logging.getLogger(__name__)
@@ -106,15 +106,6 @@ def _schedule_usage_record(
     task.add_done_callback(_consume_task_exception)
 
 
-def _usage_response(usage: UsageTotals) -> dict[str, int | float]:
-    return {
-        "prompt_tokens": usage.prompt_tokens,
-        "completion_tokens": usage.completion_tokens,
-        "total_tokens": usage.total_tokens,
-        "estimated_cost_usd": usage.estimated_cost_usd,
-    }
-
-
 def _consume_task_exception(task: asyncio.Task[object]) -> None:
     if task.cancelled():
         return
@@ -174,12 +165,6 @@ def create_router(
     @router.get("/stats", response_model=BatcherStats)
     async def stats() -> BatcherStats:
         return batcher.stats()
-
-    @router.get("/admin/keys/{key}/usage")
-    async def key_usage(key: str) -> dict[str, int | float]:
-        if usage_tracker is None:
-            return _zero_usage()
-        return _usage_response(await usage_tracker.get_usage(key))
 
     @router.post("/v1/chat/completions", response_model=None)
     async def chat_completions(

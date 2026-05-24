@@ -24,6 +24,7 @@ class UsageTotals:
     completion_tokens: int
     total_tokens: int
     estimated_cost_usd: float
+    request_count: int = 0
 
 
 class TokenCounter:
@@ -125,6 +126,7 @@ class UsageTracker:
             completion_tokens=int(raw.get("completion_tokens", 0) or 0),
             total_tokens=int(raw.get("total_tokens", 0) or 0),
             estimated_cost_usd=float(raw.get("estimated_cost_usd", 0.0) or 0.0),
+            request_count=int(raw.get("request_count", 0) or 0),
         )
 
     def calculate_usage(
@@ -167,6 +169,7 @@ class UsageTracker:
                 key, "completion_tokens", usage.completion_tokens
             )
             await self._client.hincrby(key, "total_tokens", usage.total_tokens)
+            await self._client.hincrby(key, "request_count", 1)
             await self._client.hincrbyfloat(
                 key, "estimated_cost_usd", usage.estimated_cost_usd
             )
