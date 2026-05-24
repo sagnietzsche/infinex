@@ -21,6 +21,7 @@ from services.circuit_breaker import CircuitBreaker
 from services.provider_router import ProviderRoute, ProviderRouter
 from services.rate_limit import RedisTokenBucketRateLimiter
 from services.retry import RetryPolicy
+from services.usage import UsageTracker
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -88,6 +89,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if settings.allowed_api_keys
         else None
     )
+    usage_tracker = UsageTracker(redis_url=settings.redis_url)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -100,6 +102,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if rate_limiter is not None:
             await rate_limiter.close()
         await circuit_breaker.close()
+        await usage_tracker.close()
 
     app = FastAPI(title=settings.app_name, lifespan=lifespan)
     app.state.batcher = batcher
@@ -107,6 +110,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.cache = cache
     app.state.rate_limiter = rate_limiter
     app.state.circuit_breaker = circuit_breaker
+    app.state.usage_tracker = usage_tracker
 
     @app.middleware("http")
     async def api_key_rate_limit_middleware(
@@ -141,7 +145,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.mount("/metrics", make_asgi_app())
     app.include_router(
-        create_router(batcher, streaming_batcher, cache, circuit_breaker)
+        create_router(
+            batcher,
+            streaming_batcher,
+            cache,
+            circuit_breaker,
+            usage_tracker,
+        )
     )
 
     return app
