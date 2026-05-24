@@ -156,7 +156,8 @@ The service starts on `http://0.0.0.0:8000` with hot-reload enabled.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/health` | Liveness check plus provider circuit states |
+| `GET` | `/health` | Liveness check with process uptime |
+| `GET` | `/ready` | Readiness check for Redis, queue depth, and provider circuits |
 | `GET` | `/metrics` | Prometheus metrics |
 | `GET` | `/stats` | Batcher counters |
 | `POST` | `/v1/chat/completions` | Chat completion (streaming or non-streaming) |
@@ -178,7 +179,7 @@ All settings are read from environment variables with the defaults shown below.
 | `BATCH_SIZE` | `16` | Alias for `BATCH_MAX_SIZE`; recommended tuning knob |
 | `BATCH_MAX_WAIT_MS` | `20` | Max time to wait before flushing a partial batch |
 | `MAX_WAIT_MS` | `20` | Alias for `BATCH_MAX_WAIT_MS`; recommended tuning knob |
-| `BATCH_QUEUE_MAX_SIZE` | `1024` | Max pending requests accepted before returning `503` |
+| `BATCH_QUEUE_MAX_SIZE` / `QUEUE_MAX_DEPTH` | `1024` | Max pending requests accepted before returning `503` |
 | `PROVIDER` | `echo` | LLM backend: `openai`, `anthropic`, `gemini`/`google`, `ollama`, or `echo` |
 | `PROVIDER_MODE` | `echo` | Backwards-compatible alias for `PROVIDER` |
 | `PROVIDER_FALLBACK_CHAIN` | empty | Ordered failover chain, e.g. `openai,anthropic`; first entry becomes the primary provider |
@@ -242,7 +243,8 @@ batching sweep and `503` backpressure run.
 ```
 .
 ├── api/
-│   └── routes.py        # FastAPI router: chat completions, health, stats
+│   ├── health.py        # Kubernetes liveness/readiness probes
+│   └── routes.py        # FastAPI router: chat completions, stats
 ├── core/
 │   ├── config.py        # Settings dataclass, env-var loading
 │   └── models.py        # Pydantic request/response models

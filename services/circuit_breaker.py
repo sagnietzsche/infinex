@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from enum import StrEnum
 import time
@@ -163,9 +164,12 @@ class CircuitBreaker:
         )
 
     async def snapshots(self) -> dict[str, CircuitSnapshot]:
+        snapshots = await asyncio.gather(
+            *(self.snapshot(provider) for provider in self._providers)
+        )
         return {
-            provider: await self.snapshot(provider)
-            for provider in self._providers
+            snapshot.provider: snapshot
+            for snapshot in snapshots
         }
 
     async def close(self) -> None:

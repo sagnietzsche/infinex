@@ -148,22 +148,6 @@ def create_router(
 ) -> APIRouter:
     router = APIRouter()
 
-    @router.get("/health")
-    async def health() -> dict[str, object]:
-        body: dict[str, object] = {"status": "ok"}
-        if circuit_breaker is not None:
-            snapshots = await circuit_breaker.snapshots()
-            body["circuits"] = {
-                provider: {
-                    "state": snapshot.state.value,
-                    "error_rate": snapshot.error_rate,
-                    "errors": snapshot.errors,
-                    "total": snapshot.total,
-                }
-                for provider, snapshot in snapshots.items()
-            }
-        return body
-
     @router.get("/stats", response_model=BatcherStats)
     async def stats() -> BatcherStats:
         return batcher.stats()

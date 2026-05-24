@@ -9,7 +9,7 @@ def test_batch_tuning_aliases_are_supported() -> None:
         {
             "BATCH_SIZE": "24",
             "MAX_WAIT_MS": "15",
-            "BATCH_QUEUE_MAX_SIZE": "512",
+            "QUEUE_MAX_DEPTH": "512",
         },
         clear=True,
     ):
