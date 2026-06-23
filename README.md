@@ -8,6 +8,14 @@ built in Go to be highly distributed from the ground up.
 
 something of a mini ollama
 
+
+### GGUF
+
+Download the GGUF files using hf cli and place it under `data/`
+```bash
+hf download openai-community/gpt2 --local-dir data/gpt2
+```
+
 ### Commands Supported (High Level)
 
 1. one shot (simplest)
