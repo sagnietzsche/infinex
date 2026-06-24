@@ -150,11 +150,8 @@ func GELU(t *Tensor) *Tensor {
 	for i, v := range t.Data {
 		x := float64(v)
 		out.Data[i] = float32(
-			0.5 * x *
-				//hf trick to work with gpt-2
-				(1.0 + math.Tanh(
-					math.Sqrt(2.0/math.Pi)*
-						(x*0.044715*x*x*x))))
+			0.5 * x * (1.0 + math.Tanh(math.Sqrt(2.0/math.Pi)*(x+0.044715*x*x*x))),
+		)
 	}
 	return out
 }
