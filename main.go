@@ -1,9 +1,10 @@
+/*
+Copyright © 2026 NAME HERE <EMAIL ADDRESS>
+*/
 package main
 
-import (
-	"fmt"
-)
+import "github.com/sagnikc395/infinex/cmd"
 
 func main() {
-	fmt.Println("infinex ")
+	cmd.Execute()
 }
