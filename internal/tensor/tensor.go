@@ -1,6 +1,9 @@
 package tensor
 
-import "fmt"
+import (
+	"fmt"
+	"math"
+)
 
 // index element at row i, column j of a 2d tensor as Data[i*shape[1]+j]
 type Tensor struct {
@@ -96,4 +99,62 @@ func AddBias(x, bias *Tensor) {
 			x.Data[i*cols+j] += bias.Data[j]
 		}
 	}
+}
+
+// Add used in for adding residula connections.
+
+func Add(a, b *Tensor) *Tensor {
+	out := New(a.Shape...)
+	for i, v := range a.Data {
+		out.Data[i] = v + b.Data[i]
+	}
+	return out
+}
+
+//softmax is called on the attention score matrix [seq_len, seq_len], row by row
+
+func Softmax(t *Tensor) {
+	rows, cols := t.Shape[0], t.Shape[1]
+
+	for i := 0; i < rows; i++ {
+		row := t.Data[i*cols : (i+1)*cols]
+
+		//finding the max for numerical stability
+		max := row[0]
+		for _, v := range row {
+			if v > max {
+				max = v
+			}
+		}
+
+		//exp and sum
+		var sum float32
+		for j, v := range row {
+			e := float32(math.Exp(float64(v - max)))
+			row[j] = e
+			sum += e
+		}
+
+		//normalize
+		for j := range row {
+			row[j] /= sum
+		}
+	}
+}
+
+//GELU -> applied inside the MLP block between the up-projects and the down projection
+// it is the only place in the model we can call this
+
+func GELU(t *Tensor) *Tensor {
+	out := New(t.Shape...)
+	for i, v := range t.Data {
+		x := float64(v)
+		out.Data[i] = float32(
+			0.5 * x *
+				//hf trick to work with gpt-2
+				(1.0 + math.Tanh(
+					math.Sqrt(2.0/math.Pi)*
+						(x*0.044715*x*x*x))))
+	}
+	return out
 }
