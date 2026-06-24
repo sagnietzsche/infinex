@@ -158,3 +158,39 @@ func GELU(t *Tensor) *Tensor {
 	}
 	return out
 }
+
+//Each transform block has two sets ; one for the attention pre-norm
+// and one for the MLP prenorm.
+// loading them directly from GGUF like every other file
+
+func LayerNorm(x, weight, bias *Tensor, eps float32) *Tensor {
+	rows, cols := x.Shape[0], x.Shape[1]
+	out := New(rows, cols)
+
+	for i := 0; i < rows; i++ {
+		row := x.Data[i*cols : (i+1)*cols]
+		outrow := out.Data[i*cols : (i+1)*cols]
+
+		//mean value
+		var mean float32
+		for _, v := range row {
+			mean += v
+		}
+		mean /= float32(cols)
+
+		//variance
+		var variance float32
+		for _, v := range row {
+			d := v - mean
+			variance += d * d
+		}
+		variance /= float32(cols)
+
+		//normalize and scale
+		scale := float32(1.0 / math.Sqrt(float64(variance+eps)))
+		for j, v := range row {
+			outrow[j] = (v-mean)*scale*weight.Data[j] + bias.Data[j]
+		}
+	}
+	return out
+}
